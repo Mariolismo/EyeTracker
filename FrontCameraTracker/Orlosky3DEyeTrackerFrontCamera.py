@@ -39,6 +39,12 @@ intersection_ray_count = 4  # Rays sampled for each intersection estimate
 minimum_intersection_angle_degrees = 8  # Minimum angle between sampled rays
 last_tracking_result = None  # Store the latest tracker output
 
+# TEMPORARY: manual eye center override (O). Look straight into the eye camera lens;
+# the pupil center then projects onto the eyeball center.
+center_override_collecting = False
+center_override_samples = []
+center_override_frames_needed = 30  # High-confidence pupil centers averaged per override
+
 capture_stuck_ellipses = False     # toggled with 'e'
 stuck_ellipses = []                # saved pupil ellipses
 capture_frame_counter = 0          # counts processed frames while capture is enabled
@@ -171,7 +177,39 @@ def update_eye_sphere_radius(eye_center, current_pupil_ellipse, current_pupil_co
             print(f"Radius-increasing ellipse confidence: {current_pupil_confidence * 100:.2f}%")
 
 
+def toggle_center_override():
+    global center_override_collecting
+    global center_override_samples
+    center_override_samples = []
+    center_override_collecting = not center_override_collecting
+    if center_override_collecting:
+        print("Center override: look straight into the eye camera lens.")
+    else:
+        print("Center override cancelled.")
+
+
+def collect_center_override_sample(center_x, center_y):
+    global center_override_collecting
+    global prev_model_center_avg
+    global eye_sphere_adjustment_enabled
+
+    center_override_samples.append((center_x, center_y))
+    if len(center_override_samples) < center_override_frames_needed:
+        return
+
+    # Median rejects the odd blink or lash-line fit.
+    median_center = np.median(np.array(center_override_samples), axis=0)
+    prev_model_center_avg = (int(median_center[0]), int(median_center[1]))
+    center_override_collecting = False
+    eye_sphere_adjustment_enabled = False
+    # The 5-point mapping was built from the old center, so start it over.
+    reset_front_calibration()
+    print(f"Eye center overridden to {prev_model_center_avg}; sphere affixed. F resumes automatic.")
+
+
 def get_eye_sphere_adjustment_prompt():
+    if center_override_collecting:
+        return f"Look into the eye camera... {len(center_override_samples)}/{center_override_frames_needed} (O cancels)"
     if eye_sphere_adjustment_enabled and not sphere_center_locked_2d:
         return "Press F to affix eyeball sphere"
     return "Press F again to engage automatic eye sphere adjustment"
@@ -200,6 +238,8 @@ def reset_tracking_state():
     global stuck_ellipses
     global last_tracking_result
     global last_gaze_vector_text
+    global center_override_collecting
+    global center_override_samples
 
     ray_lines = []
     model_centers = []
@@ -212,6 +252,8 @@ def reset_tracking_state():
     stuck_ellipses = []
     last_tracking_result = None
     last_gaze_vector_text = None
+    center_override_collecting = False
+    center_override_samples = []
     reset_front_calibration()
 
 
@@ -603,6 +645,9 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         ellipse = cv2.fitEllipse(final_contours[0])
         final_rotated_rect = ellipse
         center_x, center_y = map(int, ellipse[0])
+
+        if center_override_collecting and best_ratio_under_ellipse >= pupil_confidence_threshold:
+            collect_center_override_sample(center_x, center_y)
 
         if (
             eye_sphere_adjustment_enabled
@@ -1459,6 +1504,8 @@ def process_video(parent=None):
                     cv2.waitKey(0)
                 elif key in (ord('f'), ord('F')):
                     toggle_eye_sphere_adjustment()
+                elif key in (ord('o'), ord('O')):
+                    toggle_center_override()
         finally:
             cap.release()
             writer.release()
@@ -1642,6 +1689,8 @@ def selection_gui():
             elif key in (ord('f'), ord('F')):
                 toggle_eye_sphere_adjustment()
                 sync_fixed_sphere_checkbox()
+            elif key in (ord('o'), ord('O')):
+                toggle_center_override()
             elif key == ord('e'):
                 capture_stuck_ellipses = not capture_stuck_ellipses
                 capture_frame_counter = 0
@@ -1692,7 +1741,7 @@ def selection_gui():
     ).pack(pady=5)
     tk.Button(root, text="Capture Calibration Point (C)", command=calibrate).pack(pady=5)
     tk.Button(root, text="Browse Video", command=browse_video).pack(pady=5)
-    tk.Label(root, text="Q: stop | Space: pause | C: calibrate | F: fixed/auto sphere\nE: capture ellipses | X: clear ellipses\nG: grid/reset | T: start/record accuracy").pack(pady=5)
+    tk.Label(root, text="Q: stop | Space: pause | C: calibrate | F: fixed/auto sphere\nO: override eye center (look into eye camera)\nE: capture ellipses | X: clear ellipses\nG: grid/reset | T: start/record accuracy").pack(pady=5)
 
     if GL_SPHERE_AVAILABLE:
         # Start GL sphere window once
