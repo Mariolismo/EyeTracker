@@ -78,27 +78,39 @@ def load_calibration(path, image_size):
     return camera, origins
 
 
-def save_calibration(path, camera, eye_origins):
+def save_calibration(path, camera, eye_origins, extra=None):
+    """extra: more top-level keys (the app's metadata); readers ignore keys they don't know."""
     data = {"eye_origins": {eye_id: np.asarray(origin).tolist() for eye_id, origin in eye_origins.items()}}
     if camera is not None and camera.calibrated:
         data["intrinsics"] = camera.to_json()
+    data.update(extra or {})
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
 
-def save_gaze_session(path, calibration, eye_states):
+def save_gaze_session(path, calibration, eye_states, extra=None):
     """Persist a gaze calibration's samples with the eye-tracker state they were taken in.
 
     eye_states is opaque, JSON-ready data from the eye tracker (e.g. locked eye centers):
     the samples' raw gaze is only meaningful with the same eye model restored.
+    extra: more top-level keys (the app's metadata); readers ignore keys they don't know.
     """
     folder = os.path.dirname(path)
     if folder:
         os.makedirs(folder, exist_ok=True)
     data = {"saved_at": datetime.now().isoformat(timespec="seconds"), "eye_states": eye_states,
-            **calibration.to_json()}
+            **calibration.to_json(), **(extra or {})}
     with open(path, "w") as f:
         json.dump(data, f, indent=1)
+
+
+def load_extra(path, key):
+    """A top-level key written through extra=, or None (also for a missing or unreadable file)."""
+    try:
+        with open(path) as f:
+            return json.load(f).get(key)
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def load_gaze_session(path):
