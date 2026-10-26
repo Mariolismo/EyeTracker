@@ -1,11 +1,41 @@
 """Eye model per eye camera: eyeball center from pupil normals, sphere radius, gaze direction.
 
-The math is Orlosky's 3D tracker, moved unchanged from the front-camera tracker.
+The math is Orlosky's 3D tracker, moved unchanged from the front-camera tracker, where it ran
+on module globals swapped per eye. EyeTracker keeps the same state under the same names
+(STATE_NAMES) and updates it in the same order, so its output is bit-identical
+(gazecore/tests/golden). It neither draws (see eye_overlay) nor touches the gaze calibration:
+what used to reset it from inside the tracking code is now an event for the caller.
 """
 
+import logging
 import math
+import random
+from dataclasses import dataclass, field
 
 import numpy as np
+
+from .pupil_detection import PupilObservation, detect_pupil
+
+log = logging.getLogger(__name__)
+
+MAX_RAYS = 100  # Limit the number of stored pupil rays
+MIN_MODEL_CENTERS = 100  # Minimum model centers required before updating sphere radius
+PUPIL_CONFIDENCE_THRESHOLD = 0.85  # Minimum pupil confidence for storing a ray
+PUPIL_CONFIDENCE_THRESHOLD_SPHERE = 0.90  # Minimum pupil confidence for determining eye sphere radius
+INTERSECTION_RAY_COUNT = 4  # Rays sampled for each intersection estimate
+MINIMUM_INTERSECTION_ANGLE_DEGREES = 8  # Minimum angle between sampled rays
+MAX_STORED_INTERSECTIONS = 1500
+MODEL_CENTER_AVERAGE_COUNT = 200
+CENTER_OVERRIDE_FRAMES_NEEDED = 30  # High-confidence pupil centers averaged per override
+INITIAL_MODEL_CENTER = (320, 240)  # Preserve the last valid eye center
+
+STATE_NAMES = (
+    "ray_lines", "model_centers", "prev_model_center_avg", "max_observed_distance",
+    "last_sphere_radius_ellipse", "last_gaze_vector_text", "last_tracking_result",
+    "stored_intersections", "last_sphere_center", "last_gaze_dir", "calibrated_sphere_center",
+    "sphere_center_locked_2d", "locked_model_center_avg", "eye_sphere_adjustment_enabled",
+    "center_override_collecting", "center_override_samples",
+)
 
 
 def distance_to_pupil_outer_edge(eye_center, pupil_ellipse):
@@ -227,3 +257,345 @@ def gaze_vector_from_pixels(x, y, center_x, center_y, screen_width=640, screen_h
     gaze_rotated /= np.linalg.norm(gaze_rotated)
 
     return sphere_center, gaze_rotated
+
+
+@dataclass
+class CenterOverrideDone:
+    """The O override set the eyeball center and affixed the sphere.
+
+    The gaze calibration was built from the old center, so the caller must start it over.
+    """
+
+    eye_id: str
+    center: tuple
+
+
+@dataclass
+class EyeResult:
+    """One eye frame's outcome. The tracker's state after the frame is on the EyeTracker."""
+
+    observation: PupilObservation
+    status: str  # "ok", "no_pupil" (no ellipse: gaze lost), "no_dark_area" (frame skipped, state untouched)
+    model_center: tuple  # Projected eyeball center used this frame (eye frame pixels)
+    sphere_radius: float  # Eye sphere radius drawn on the eye view (pixels)
+    gaze_dir: np.ndarray  # Raw gaze after this frame, as fed to the gaze calibration (None when lost)
+    gaze_output: list  # Sphere center + gaze for gaze_vector.txt (6 floats); None when not computed
+    gaze_vector_text: tuple  # (origin, direction) lines of the eye view; kept through dropouts
+    locked: bool
+    adjusting: bool  # The eyeball center and radius still adapt
+    override_samples: int  # Pupil centers collected by a running O override, else None
+    events: list = field(default_factory=list)
+
+    @property
+    def frame(self):
+        return self.observation.frame
+
+    @property
+    def ellipse(self):
+        return self.observation.ellipse
+
+    @property
+    def pupil_center(self):
+        return self.observation.center
+
+    @property
+    def confidence(self):
+        return self.observation.confidence
+
+
+class EyeTracker:
+    """Eye model of one eye camera; feed it every frame of that camera with process()."""
+
+    def __init__(self, eye_id, rng=random):
+        self.eye_id = eye_id
+        # Both eyes share the global generator by default, like the original tracker.
+        self.rng = rng
+        self.reset()
+
+    def reset(self):
+        self.ray_lines = []  # Store recent pupil ellipse rays
+        self.model_centers = []  # Store recent estimated eye centers
+        self.prev_model_center_avg = INITIAL_MODEL_CENTER
+        self.max_observed_distance = 0  # Initialize adaptive radius
+        self.last_sphere_radius_ellipse = None  # Last pupil ellipse used to expand the eye sphere radius
+        self.last_gaze_vector_text = None  # Preserve vector text during temporary detection dropouts
+        self.last_tracking_result = None  # Store the latest tracker output
+        self.stored_intersections = []  # Stores all past intersections
+        self.last_sphere_center = None
+        self.last_gaze_dir = None
+        self.calibrated_sphere_center = None
+        self.sphere_center_locked_2d = False
+        self.locked_model_center_avg = INITIAL_MODEL_CENTER
+        self.eye_sphere_adjustment_enabled = True  # Automatic eye center/radius updates (F)
+        self.center_override_collecting = False
+        self.center_override_samples = []
+
+    def get_state(self):
+        """The state under the original tracker's global names (shared, not copied)."""
+        return {name: getattr(self, name) for name in STATE_NAMES}
+
+    def set_state(self, state):
+        for name in STATE_NAMES:
+            setattr(self, name, state[name])
+
+    @property
+    def adjusting(self):
+        return self.eye_sphere_adjustment_enabled and not self.sphere_center_locked_2d
+
+    @property
+    def fixed(self):
+        """Affixed (F, override) or locked: the eyeball center no longer moves."""
+        return self.sphere_center_locked_2d or not self.eye_sphere_adjustment_enabled
+
+    # --- Commands ---
+
+    def set_adjustment_enabled(self, enabled):
+        self.eye_sphere_adjustment_enabled = enabled
+
+    def lock_sphere(self):
+        """Freeze the eyeball center (and its 3D sphere center) for a gaze calibration."""
+        if self.last_sphere_center is not None:
+            self.calibrated_sphere_center = self.last_sphere_center.copy()
+        self.locked_model_center_avg = self.prev_model_center_avg
+        self.sphere_center_locked_2d = True
+
+    def unlock_sphere(self):
+        self.calibrated_sphere_center = None
+        self.last_sphere_center = None
+        self.last_gaze_dir = None
+        self.sphere_center_locked_2d = False
+        self.locked_model_center_avg = self.prev_model_center_avg
+
+    def toggle_center_override(self):
+        """Start or cancel the O override: look straight into the eye camera's lens.
+
+        The pupil center then projects onto the eyeball center. Returns True when started.
+        """
+        self.center_override_samples = []
+        self.center_override_collecting = not self.center_override_collecting
+        return self.center_override_collecting
+
+    def locked_state(self):
+        """The eye-model state that raw gaze depends on (JSON-ready), as saved with samples."""
+        sphere_center = self.calibrated_sphere_center
+        return {
+            "model_center": [int(v) for v in self.locked_model_center_avg],
+            "sphere_radius": float(self.max_observed_distance),
+            "sphere_center": None if sphere_center is None else [float(v) for v in sphere_center],
+            "adjustment_enabled": bool(self.eye_sphere_adjustment_enabled),
+        }
+
+    def apply_locked_state(self, state):
+        """Lock the model to a saved locked_state(), so restored samples match it again."""
+        self.prev_model_center_avg = self.locked_model_center_avg = tuple(int(v) for v in state["model_center"])
+        self.max_observed_distance = state["sphere_radius"]
+        sphere_center = state["sphere_center"]
+        self.calibrated_sphere_center = None if sphere_center is None else np.asarray(sphere_center, dtype=float)
+        self.eye_sphere_adjustment_enabled = state["adjustment_enabled"]
+        self.sphere_center_locked_2d = True
+
+    # --- Per frame ---
+
+    def process(self, frame):
+        """Track one BGR frame of this eye's camera (any size)."""
+        return self.update(detect_pupil(frame))
+
+    def update(self, observation):
+        if observation.darkest_point is None:
+            return self._result(observation, "no_dark_area", self.prev_model_center_avg, None, [])
+
+        events = []
+        final_rotated_rect = observation.ellipse
+        center_x, center_y = observation.center
+        best_ratio_under_ellipse = observation.confidence
+
+        if final_rotated_rect is not None:
+            if self.center_override_collecting and best_ratio_under_ellipse >= PUPIL_CONFIDENCE_THRESHOLD:
+                self._collect_center_override_sample(center_x, center_y, events)
+
+            if (
+                self.eye_sphere_adjustment_enabled
+                and not self.sphere_center_locked_2d
+                and best_ratio_under_ellipse >= PUPIL_CONFIDENCE_THRESHOLD
+            ):
+                self.ray_lines.append(final_rotated_rect)
+                if len(self.ray_lines) > MAX_RAYS:
+                    num_to_remove = len(self.ray_lines) - MAX_RAYS
+                    self.ray_lines = self.ray_lines[num_to_remove:]  # Keep only the last MAX_RAYS elements
+
+        model_center_average = (self.locked_model_center_avg if self.sphere_center_locked_2d
+                                else self.prev_model_center_avg)
+
+        if self.eye_sphere_adjustment_enabled and not self.sphere_center_locked_2d:
+            model_center = self._compute_average_intersection(
+                observation.frame.shape,
+                self.ray_lines,
+                INTERSECTION_RAY_COUNT,
+                MAX_STORED_INTERSECTIONS,
+                MINIMUM_INTERSECTION_ANGLE_DEGREES,
+            )
+            if model_center is not None and model_center != (0, 0):
+                model_center_average = update_and_average_point(
+                    self.model_centers, model_center, MODEL_CENTER_AVERAGE_COUNT)
+
+        if model_center_average[0] == 320:
+            model_center_average = self.prev_model_center_avg
+        if model_center_average[0] != 0:
+            self.prev_model_center_avg = model_center_average
+            if not self.sphere_center_locked_2d:
+                self.locked_model_center_avg = model_center_average
+
+        if (final_rotated_rect is None or center_x is None or center_y is None
+                or model_center_average[0] is None or model_center_average[1] is None):
+            self.last_tracking_result = None
+            self.last_gaze_dir = None
+            return self._result(observation, "no_pupil", model_center_average, None, events)
+
+        if self.eye_sphere_adjustment_enabled and not self.sphere_center_locked_2d:
+            self._update_eye_sphere_radius(model_center_average, final_rotated_rect, best_ratio_under_ellipse)
+
+        self.last_tracking_result = {
+            "pupil_ellipse": {
+                "center": [float(final_rotated_rect[0][0]), float(final_rotated_rect[0][1])],
+                "axes": [float(final_rotated_rect[1][0]), float(final_rotated_rect[1][1])],
+                "angle_degrees": float(final_rotated_rect[2]),
+            },
+            "eye_center": [int(model_center_average[0]), int(model_center_average[1])],
+            "sphere_radius": float(self.max_observed_distance),
+        }
+
+        sphere_center, gaze_rotated = gaze_vector_from_pixels(
+            center_x, center_y, model_center_average[0], model_center_average[1])
+        self.last_sphere_center = sphere_center.copy()
+        self.last_gaze_dir = gaze_rotated.copy()
+        sphere_center_out = (self.calibrated_sphere_center if self.calibrated_sphere_center is not None
+                             else sphere_center)
+        gaze_output = [float(v) for v in np.concatenate((sphere_center_out, gaze_rotated))]
+
+        center, direction = sphere_center_out, gaze_rotated
+        origin_text = f"Origin: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f})"
+        dir_text    = f"Direction: ({direction[0]:.2f}, {direction[1]:.2f}, {direction[2]:.2f})"
+        self.last_gaze_vector_text = (origin_text, dir_text)
+        return self._result(observation, "ok", model_center_average, gaze_output, events)
+
+    def _result(self, observation, status, model_center, gaze_output, events):
+        return EyeResult(
+            observation, status, model_center, float(self.max_observed_distance), self.last_gaze_dir,
+            gaze_output, self.last_gaze_vector_text, bool(self.sphere_center_locked_2d), bool(self.adjusting),
+            len(self.center_override_samples) if self.center_override_collecting else None, events,
+        )
+
+    def _collect_center_override_sample(self, center_x, center_y, events):
+        self.center_override_samples.append((center_x, center_y))
+        if len(self.center_override_samples) < CENTER_OVERRIDE_FRAMES_NEEDED:
+            return
+
+        # Median rejects the odd blink or lash-line fit.
+        median_center = np.median(np.array(self.center_override_samples), axis=0)
+        self.prev_model_center_avg = (int(median_center[0]), int(median_center[1]))
+        self.center_override_collecting = False
+        self.eye_sphere_adjustment_enabled = False
+        self.unlock_sphere()
+        events.append(CenterOverrideDone(self.eye_id, self.prev_model_center_avg))
+        log.info("%s eye center overridden to %s; sphere affixed.", self.eye_id.title(), self.prev_model_center_avg)
+
+    def _update_eye_sphere_radius(self, eye_center, current_pupil_ellipse, current_pupil_confidence):
+        if self.last_sphere_radius_ellipse is not None:
+            anchored_distance = distance_to_pupil_outer_edge(
+                eye_center,
+                self.last_sphere_radius_ellipse,
+            )
+            if anchored_distance is not None:
+                self.max_observed_distance = anchored_distance
+
+        if (
+            current_pupil_ellipse is not None
+            and current_pupil_confidence >= PUPIL_CONFIDENCE_THRESHOLD_SPHERE
+            and len(self.model_centers) >= MIN_MODEL_CENTERS
+        ):
+            current_distance = distance_to_pupil_outer_edge(
+                eye_center,
+                current_pupil_ellipse,
+            )
+            if (
+                current_distance is not None
+                and (
+                    self.last_sphere_radius_ellipse is None
+                    or current_distance > self.max_observed_distance
+                )
+            ):
+                self.max_observed_distance = current_distance
+                self.last_sphere_radius_ellipse = current_pupil_ellipse
+                log.info("Radius-increasing ellipse confidence: %.2f%%", current_pupil_confidence * 100)
+
+    def _compute_average_intersection(self, frame_shape, ray_lines, number_lines, total_lines, minimum_angle_degrees):
+        """
+        Selects `number_lines` random lines from the list, computes their intersections,
+        conditionally stores them (only if they agree within `pixel_limit`), and prunes
+        stored intersections when exceeding `total_lines`.
+        """
+        pixel_limit = 30
+        angle_threshold = 5  # degrees
+
+        if len(ray_lines) < 2 or number_lines < 2:
+            return (0, 0)
+
+        height, width = frame_shape[:2]
+
+        selected_lines = self.rng.sample(ray_lines, min(number_lines, len(ray_lines)))
+
+        intersections = []
+        for i in range(len(selected_lines) - 1):
+            line1 = selected_lines[i]
+            line2 = selected_lines[i + 1]
+
+            angle1 = line1[2]
+            angle2 = line2[2]
+
+            if abs(angle1 - angle2) >= minimum_angle_degrees:
+                intersection = find_line_intersection(line1, line2)
+                if intersection and (0 <= intersection[0] < width) and (0 <= intersection[1] < height):
+                    intersections.append(intersection)
+
+        # Nothing usable this frame
+        if not intersections:
+            return (0, 0)
+
+        # Check mutual agreement within pixel_limit
+        accept = True
+        if len(intersections) >= 2:
+            for i in range(len(intersections)):
+                for j in range(i + 1, len(intersections)):
+                    # --- distance check ---
+                    dx = intersections[i][0] - intersections[j][0]
+                    dy = intersections[i][1] - intersections[j][1]
+                    if (dx * dx + dy * dy) ** 0.5 > pixel_limit:
+                        accept = False
+                        break
+
+                    # --- angle check ---
+                    angle_i = selected_lines[i][2]
+                    angle_j = selected_lines[j][2]
+                    if abs(angle_i - angle_j) < angle_threshold:
+                        accept = False
+                        break
+                if not accept:
+                    break
+
+        if accept:
+            self.stored_intersections.extend(intersections)
+
+        # Prune stored intersections
+        if len(self.stored_intersections) > total_lines:
+            self.stored_intersections = prune_intersections(self.stored_intersections, total_lines)
+
+        if not self.stored_intersections:
+            return (0, 0)
+
+        avg_x = np.mean([pt[0] for pt in self.stored_intersections])
+        avg_y = np.mean([pt[1] for pt in self.stored_intersections])
+
+        if np.isnan(avg_x) or np.isnan(avg_y):
+            return (0, 0)
+
+        return (int(avg_x), int(avg_y))
