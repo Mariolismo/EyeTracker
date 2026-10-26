@@ -281,7 +281,9 @@ def crop_to_aspect_ratio(image, width=640, height=480):
 
 # Apply thresholding to an image
 def apply_binary_threshold(image, darkestPixelValue, addedThreshold):
-    threshold = darkestPixelValue + addedThreshold
+    # Cast to int so uint8 pixel values do not wrap when adding the offset.
+    threshold = int(darkestPixelValue) + int(addedThreshold)
+    threshold = max(0, min(255, threshold))
     _, thresholded_image = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY_INV)
     return thresholded_image
 
@@ -306,7 +308,7 @@ def get_darkest_area(image):
                 for dx in range(0, searchArea, internalSkipSize):
                     if x + dx >= gray.shape[1]:
                         break
-                    current_sum += gray[y + dy][x + dx]
+                    current_sum += int(gray[y + dy, x + dx])
                     num_pixels += 1
 
             if current_sum < min_sum and num_pixels > 0:
@@ -1357,10 +1359,12 @@ def process_frame(frame, return_rendered_frame=False):
 
     #find the darkest point
     darkest_point = get_darkest_area(frame)
+    if darkest_point is None:
+        return (None, frame) if return_rendered_frame else None
 
     # Convert to grayscale to handle pixel value operations
     gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    darkest_pixel_value = gray_frame[darkest_point[1], darkest_point[0]]
+    darkest_pixel_value = int(gray_frame[darkest_point[1], darkest_point[0]])
     
     # apply thresholding operations at different levels
     # at least one should give us a good ellipse segment
@@ -1408,7 +1412,7 @@ def process_video(parent=None):
     while True:
         video_path = filedialog.askopenfilename(
             parent=parent,
-            filetypes=[("Video Files", "*.mp4;*.avi")],
+            filetypes=[("Video Files", "*.mp4 *.avi"), ("All files", "*.*")],
         )
 
         if not video_path:
