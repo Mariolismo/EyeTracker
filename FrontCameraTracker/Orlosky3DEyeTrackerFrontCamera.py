@@ -8,7 +8,7 @@ F affixes/resumes sphere localization (resuming clears calibration).
 """
 
 import cv2
-import random
+import logging
 import numpy as np
 import os
 import tkinter as tk
@@ -24,11 +24,8 @@ sys.path.insert(0, SCRIPT_DIR)
 from gazecore import front_calibration as fc
 from gazecore import gaze_geometry as gg
 from gazecore import paths
-from gazecore.eye_tracker import (
-    distance_to_pupil_outer_edge, find_line_intersection, gaze_vector_from_pixels, prune_intersections,
-    update_and_average_point,
-)
-from gazecore.pupil_detection import detect_pupil
+from gazecore.eye_overlay import draw_eye_overlay
+from gazecore.eye_tracker import CENTER_OVERRIDE_FRAMES_NEEDED, STATE_NAMES, CenterOverrideDone, EyeTracker
 
 try:
     import gl_sphere
@@ -39,25 +36,18 @@ except ImportError:
 
 ray_lines = []  # Store recent pupil ellipse rays
 model_centers = []  # Store recent estimated eye centers
-min_model_centers = 100  # Minimum model centers required before updating sphere radius
-max_rays = 100  # Limit the number of stored pupil rays
 prev_model_center_avg = (320,240)  # Preserve the last valid eye center
 max_observed_distance = 0  # Initialize adaptive radius
 last_sphere_radius_ellipse = None  # Last pupil ellipse used to expand the eye sphere radius
 last_gaze_vector_text = None  # Preserve vector text during temporary detection dropouts
 eye_sphere_adjustment_enabled = True  # Toggle automatic eye center/radius updates with F
-render_intersections = False  # Release view omits intersection debugging overlays
-pupil_confidence_threshold = 0.85  # Minimum pupil confidence for storing a ray
-pupil_confidence_threshold_sphere = 0.90  # Minimum pupil confidence for determining eye sphere radius
-intersection_ray_count = 4  # Rays sampled for each intersection estimate
-minimum_intersection_angle_degrees = 8  # Minimum angle between sampled rays
 last_tracking_result = None  # Store the latest tracker output
+stored_intersections = []  # Stores all past intersections
 
 # TEMPORARY: manual eye center override (O). Look straight into the eye camera lens;
 # the pupil center then projects onto the eyeball center.
 center_override_collecting = False
 center_override_samples = []
-center_override_frames_needed = 30  # High-confidence pupil centers averaged per override
 
 capture_stuck_ellipses = False     # toggled with 'e'
 stuck_ellipses = []                # saved pupil ellipses
@@ -85,13 +75,7 @@ locked_model_center_avg = prev_model_center_avg
 
 EYE_IDS = ("left", "right")
 current_eye_id = "left"
-PER_EYE_STATE_NAMES = (
-    "ray_lines", "model_centers", "prev_model_center_avg", "max_observed_distance",
-    "last_sphere_radius_ellipse", "last_gaze_vector_text", "last_tracking_result",
-    "stored_intersections", "last_sphere_center", "last_gaze_dir", "calibrated_sphere_center",
-    "sphere_center_locked_2d", "locked_model_center_avg", "eye_sphere_adjustment_enabled",
-    "center_override_collecting", "center_override_samples",
-)
+PER_EYE_STATE_NAMES = STATE_NAMES  # gazecore.EyeTracker tracks a loaded eye's globals frame by frame
 eye_gaze_outputs = {eye_id: [0.0] * 6 for eye_id in EYE_IDS}
 
 # External camera / screen params (for 640x480)
@@ -197,39 +181,6 @@ def eye_window_name(base_name):
     return f"{current_eye_id.title()} Eye {base_name}"
 
 
-def update_eye_sphere_radius(eye_center, current_pupil_ellipse, current_pupil_confidence):
-    global max_observed_distance
-    global last_sphere_radius_ellipse
-
-    if last_sphere_radius_ellipse is not None:
-        anchored_distance = distance_to_pupil_outer_edge(
-            eye_center,
-            last_sphere_radius_ellipse,
-        )
-        if anchored_distance is not None:
-            max_observed_distance = anchored_distance
-
-    if (
-        current_pupil_ellipse is not None
-        and current_pupil_confidence >= pupil_confidence_threshold_sphere
-        and len(model_centers) >= min_model_centers
-    ):
-        current_distance = distance_to_pupil_outer_edge(
-            eye_center,
-            current_pupil_ellipse,
-        )
-        if (
-            current_distance is not None
-            and (
-                last_sphere_radius_ellipse is None
-                or current_distance > max_observed_distance
-            )
-        ):
-            max_observed_distance = current_distance
-            last_sphere_radius_ellipse = current_pupil_ellipse
-            print(f"Radius-increasing ellipse confidence: {current_pupil_confidence * 100:.2f}%")
-
-
 def toggle_center_override(eye_id):
     def toggle(_):
         global center_override_collecting
@@ -244,31 +195,11 @@ def toggle_center_override(eye_id):
     for_all_eyes(toggle, (eye_id,))
 
 
-def collect_center_override_sample(center_x, center_y):
-    global center_override_collecting
-    global prev_model_center_avg
-    global eye_sphere_adjustment_enabled
-
-    center_override_samples.append((center_x, center_y))
-    if len(center_override_samples) < center_override_frames_needed:
-        return
-
-    # Median rejects the odd blink or lash-line fit.
-    median_center = np.median(np.array(center_override_samples), axis=0)
-    prev_model_center_avg = (int(median_center[0]), int(median_center[1]))
-    center_override_collecting = False
-    eye_sphere_adjustment_enabled = False
-    # The gaze calibration was built from the old center, so start it over.
-    reset_front_calibration()
-    print(f"{current_eye_id.title()} eye center overridden to {prev_model_center_avg}; "
-          "sphere affixed. F resumes automatic.")
-
-
 def get_eye_sphere_adjustment_prompt():
     if center_override_collecting:
         cancel_key = "o" if current_eye_id == "left" else "Shift+O"
         return (f"Look into the eye camera... {len(center_override_samples)}/"
-                f"{center_override_frames_needed} ({cancel_key} cancels)")
+                f"{CENTER_OVERRIDE_FRAMES_NEEDED} ({cancel_key} cancels)")
     if eye_sphere_adjustment_enabled and not sphere_center_locked_2d:
         return "Press F to affix eyeball sphere"
     return "Press F again to engage automatic eye sphere adjustment"
@@ -320,39 +251,6 @@ def reset_tracking_state():
     reset_front_calibration()
 
 
-def draw_persistent_overlays(frame):
-    prompt_text = get_eye_sphere_adjustment_prompt()
-    prompt_shadow = (12, frame.shape[0] - 63)
-    prompt_origin = (10, frame.shape[0] - 65)
-    cv2.putText(frame, prompt_text, prompt_shadow, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-    cv2.putText(frame, prompt_text, prompt_origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-
-    if last_gaze_vector_text is None:
-        return
-
-    origin_text, dir_text = last_gaze_vector_text
-    text_origin = (12, frame.shape[0] - 38)
-    text_dir = (12, frame.shape[0] - 13)
-    text_origin_green = (10, frame.shape[0] - 40)
-    text_dir_green = (10, frame.shape[0] - 15)
-
-    cv2.putText(frame, origin_text, text_origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-    cv2.putText(frame, dir_text, text_dir, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-    cv2.putText(frame, origin_text, text_origin_green, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-    cv2.putText(frame, dir_text, text_dir_green, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-
-def get_last_tracking_result():
-    return last_tracking_result
-
-
-def draw_stuck_ellipses(frame):
-    global stuck_ellipses
-
-    for ellipse in stuck_ellipses:
-        if ellipse is not None:
-            cv2.ellipse(frame, ellipse,(0, 255, 255), 2)
-
 # Function to detect available cameras
 def detect_cameras(max_cams=10):
     available_cameras = []
@@ -364,310 +262,6 @@ def detect_cameras(max_cams=10):
             cap.release()
 
     return available_cameras
-
-# Process frames for pupil detection
-def process_frames(observation):
-    """Update the loaded eye's model from one pupil observation, then draw and show the eye view."""
-    global ray_lines
-    global max_rays
-    global prev_model_center_avg
-    global max_observed_distance
-    global last_sphere_radius_ellipse
-    global last_tracking_result
-    global last_gaze_vector_text
-    global last_gaze_dir
-    global capture_stuck_ellipses
-    global stuck_ellipses
-    global capture_frame_counter
-    global ellipse_capture_interval
-    global max_stuck_ellipses
-
-    frame = observation.frame
-    final_rotated_rect = observation.ellipse
-    center_x, center_y = observation.center
-    best_ratio_under_ellipse = observation.confidence
-
-    if final_rotated_rect is not None:
-        if center_override_collecting and best_ratio_under_ellipse >= pupil_confidence_threshold:
-            collect_center_override_sample(center_x, center_y)
-
-        if (
-            eye_sphere_adjustment_enabled
-            and not sphere_center_locked_2d
-            and best_ratio_under_ellipse >= pupil_confidence_threshold
-        ):
-            ray_lines.append(final_rotated_rect)
-            if len(ray_lines) > max_rays:
-                num_to_remove = len(ray_lines) - max_rays
-                ray_lines = ray_lines[num_to_remove:]  # Keep only the last `max_rays` elements
-
-    global locked_model_center_avg
-    model_center_average = locked_model_center_avg if sphere_center_locked_2d else prev_model_center_avg
-
-    if eye_sphere_adjustment_enabled and not sphere_center_locked_2d:
-        model_center = compute_average_intersection(
-            frame,
-            ray_lines,
-            intersection_ray_count,
-            1500,
-            minimum_intersection_angle_degrees,
-        )
-        if model_center is not None and model_center != (0, 0):
-            model_center_average = update_and_average_point(model_centers, model_center, 200)
-
-    if model_center_average[0] == 320:
-        model_center_average = prev_model_center_avg
-    if model_center_average[0] != 0:
-        prev_model_center_avg = model_center_average
-        if not sphere_center_locked_2d:
-            locked_model_center_avg = model_center_average
-    
-    # Example safety check
-    if final_rotated_rect is None or center_x is None or center_y is None or model_center_average[0] is None or model_center_average[1] is None:
-        last_tracking_result = None
-        last_gaze_dir = None
-        draw_persistent_overlays(frame)
-        cv2.imshow(eye_window_name("Frame with Ellipse and Rays"), frame)
-        return  # or skip this frame
-
-    if eye_sphere_adjustment_enabled and not sphere_center_locked_2d:
-        update_eye_sphere_radius(
-            model_center_average,
-            final_rotated_rect,
-            best_ratio_under_ellipse,
-        )
-
-    last_tracking_result = {
-        "pupil_ellipse": {
-            "center": [float(final_rotated_rect[0][0]), float(final_rotated_rect[0][1])] if final_rotated_rect is not None else None,
-            "axes": [float(final_rotated_rect[1][0]), float(final_rotated_rect[1][1])] if final_rotated_rect is not None else None,
-            "angle_degrees": float(final_rotated_rect[2]) if final_rotated_rect is not None else None,
-        } if final_rotated_rect is not None else None,
-        "eye_center": [int(model_center_average[0]), int(model_center_average[1])],
-        "sphere_radius": float(max_observed_distance),
-    }
-
-    # Draw reference lines/ellipses
-    cv2.circle(frame, model_center_average, int(max_observed_distance), (255, 50, 50), 2)  # Draw eye sphere (circle)
-    cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)  # Draw eye center
-
-
-
-    if final_rotated_rect is not None and center_x is not None and center_y is not None:
-        cv2.line(frame, model_center_average, (center_x, center_y), (255, 150, 50), 2)  # # Draw line from eye center to ellipse center
-        
-    if final_rotated_rect is not None:
-        cv2.ellipse(frame, final_rotated_rect, (20, 255, 255), 2)  # draw current ellipse
-
-        # If capture mode is on, save one ellipse every N frames
-        if capture_stuck_ellipses:
-            capture_frame_counter += 1
-            if capture_frame_counter % ellipse_capture_interval == 0:
-                stuck_ellipses.append(final_rotated_rect)
-
-                # safety cap so list does not grow forever
-                if len(stuck_ellipses) > max_stuck_ellipses:
-                    stuck_ellipses = stuck_ellipses[-max_stuck_ellipses:]
-
-    # Draw previously saved ellipses so they stay "stuck" on screen
-        draw_stuck_ellipses(frame)
-
-    # Calculate the extended endpoint of gaze line
-    if final_rotated_rect is not None and center_x is not None and center_y is not None:
-        # Compute the vector from model_center_average to center_x, center_y
-        dx = center_x - model_center_average[0]
-        dy = center_y - model_center_average[1]
-
-        # Scale the vector by 1.2x
-        extended_x = int(model_center_average[0] + 2 * dx)
-        extended_y = int(model_center_average[1] + 2 * dy)
-
-        # Draw the extended gaze line
-        cv2.line(frame, (center_x, center_y), (extended_x, extended_y), (200, 255, 0), 3) 
-
-
-
-
-    # The single GL sphere window follows the left eye.
-    gl_image = None
-    if GL_SPHERE_AVAILABLE and current_eye_id == "left":
-        gl_image = gl_sphere.update_sphere_rotation(center_x, center_y, model_center_average[0], model_center_average[1])
-    #cv2.circle(frame, (center_x, center_y), 22, (255, 255, 0), -1)  # Draw intersection center
-
-    # Call the function
-    center, direction = compute_gaze_vector(center_x, center_y, model_center_average[0], model_center_average[1])
-
-    if center is not None and direction is not None:
-        origin_text = f"Origin: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f})"
-        dir_text    = f"Direction: ({direction[0]:.2f}, {direction[1]:.2f}, {direction[2]:.2f})"
-        last_gaze_vector_text = (origin_text, dir_text)
-
-    ratio_text = f"{best_ratio_under_ellipse * 100:.2f}%"
-    cv2.putText(frame, ratio_text, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
-    cv2.putText(frame, ratio_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-    draw_persistent_overlays(frame)
-    cv2.imshow(eye_window_name("Frame with Ellipse and Rays"), frame)
-
-    if gl_image is not None:
-        blended = cv2.addWeighted(frame, 0.6, gl_image, 0.4, 0)
-        cv2.imshow(eye_window_name("Tracker + Sphere"), blended)
-
-    return final_rotated_rect
-
-def draw_orthogonal_ray(image, ellipse, length=100, color=(0, 255, 0), thickness=1):
-    """
-    Draws a ray passing through the center of an ellipse orthogonally to its major axis.
-    
-    Parameters:
-    - image: The OpenCV image to draw on.
-    - ellipse: A tuple ((cx, cy), (major_axis, minor_axis), angle) representing the fitted ellipse.
-    - length: Length of the ray to draw on each side of the ellipse center.
-    - color: Color of the line in BGR format (default: green).
-    - thickness: Thickness of the line (default: 2).
-    """
-
-    (cx, cy), (major_axis, minor_axis), angle = ellipse
-    
-    # Convert angle to radians
-    angle_rad = np.deg2rad(angle)
-    
-    # Compute the normal vector at the ellipse center (perpendicular to surface)
-    normal_dx = (minor_axis / 2) * np.cos(angle_rad)  # Minor axis component
-    normal_dy = (minor_axis / 2) * np.sin(angle_rad)
-
-    # Compute start and end points of the orthogonal ray
-    pt1 = (int(cx - length * normal_dx / (minor_axis / 2)), int(cy - length * normal_dy / (minor_axis / 2)))
-    pt2 = (int(cx + length * normal_dx / (minor_axis / 2)), int(cy + length * normal_dy / (minor_axis / 2)))
-
-    # Draw the ray
-    cv2.line(image, pt1, pt2, color, thickness)
-
-    return image 
-
-stored_intersections = []  # Stores all past intersections
-
-def compute_average_intersection(frame, ray_lines, number_lines, total_lines, minimum_angle_degrees):
-    """
-    Selects `number_lines` random lines from the list, highlights them in red on the frame,
-    computes their intersections, conditionally stores them (only if they agree within
-    `pixel_limit`), and prunes stored intersections when exceeding `total_lines`.
-    """
-    pixel_limit = 30
-    angle_threshold = 5  # degrees
-
-    global stored_intersections
-
-    if len(ray_lines) < 2 or number_lines < 2:
-        return (0, 0)
-
-    height, width = frame.shape[:2]
-
-    selected_lines = random.sample(ray_lines, min(number_lines, len(ray_lines)))
-
-    # Highlight selected rays
-    if render_intersections:
-        for ray in selected_lines:
-            draw_orthogonal_ray(frame, ray, color=(0, 0, 255), thickness=2)
-
-    intersections = []
-    for i in range(len(selected_lines) - 1):
-        line1 = selected_lines[i]
-        line2 = selected_lines[i + 1]
-
-        angle1 = line1[2]
-        angle2 = line2[2]
-
-        if abs(angle1 - angle2) >= minimum_angle_degrees:
-            intersection = find_line_intersection(line1, line2)
-            if intersection and (0 <= intersection[0] < width) and (0 <= intersection[1] < height):
-                intersections.append(intersection)
-
-    # Nothing usable this frame
-    if not intersections:
-        return (0, 0)
-
-    # Check mutual agreement within pixel_limit
-    accept = True
-    if len(intersections) >= 2:
-        for i in range(len(intersections)):
-            for j in range(i + 1, len(intersections)):
-                # --- distance check ---
-                dx = intersections[i][0] - intersections[j][0]
-                dy = intersections[i][1] - intersections[j][1]
-                if (dx * dx + dy * dy) ** 0.5 > pixel_limit:
-                    accept = False
-                    break
-
-                # --- angle check ---
-                angle_i = selected_lines[i][2]
-                angle_j = selected_lines[j][2]
-                if abs(angle_i - angle_j) < angle_threshold:
-                    accept = False
-                    break
-            if not accept:
-                break
-
-    if accept:
-        stored_intersections.extend(intersections)
-
-    # Prune stored intersections
-    if len(stored_intersections) > total_lines:
-        stored_intersections = prune_intersections(stored_intersections, total_lines)
-
-    if not stored_intersections:
-        return (0, 0)
-
-    # Draw stored intersections
-    if render_intersections:
-        for pt in stored_intersections:
-            cv2.circle(frame, pt, 3, (255, 255, 255), -1)
-
-    avg_x = np.mean([pt[0] for pt in stored_intersections])
-    avg_y = np.mean([pt[1] for pt in stored_intersections])
-
-    if np.isnan(avg_x) or np.isnan(avg_y):
-        return (0, 0)
-
-    return (int(avg_x), int(avg_y))
-
-def rotation_from_a_to_b(a, b):
-    """
-    Compute rotation matrix R such that R @ a = b
-    using Rodrigues' rotation formula.
-    """
-    a = a / np.linalg.norm(a)
-    b = b / np.linalg.norm(b)
-
-    v = np.cross(a, b)
-    c = np.dot(a, b)
-
-    if np.linalg.norm(v) < 1e-6:
-        # Vectors are parallel or nearly so
-        if c > 0:
-            return np.eye(3, dtype=np.float32)
-        else:
-            # 180-degree flip: choose any axis orthogonal to a
-            axis = np.array([1.0, 0.0, 0.0])
-            if abs(a[0]) > 0.9:
-                axis = np.array([0.0, 1.0, 0.0])
-            v = np.cross(a, axis)
-            v = v / np.linalg.norm(v)
-            s = np.linalg.norm(v)
-    else:
-        s = np.linalg.norm(v)
-        v = v / s
-
-    # Skew-symmetric cross-product matrix
-    vx, vy, vz = v
-    K = np.array([
-        [0,    -vz,  vy],
-        [vz,    0,  -vx],
-        [-vy,  vx,   0 ]
-    ], dtype=np.float32)
-
-    R = np.eye(3, dtype=np.float32) + K * s + (K @ K) * ((1 - c) / (s ** 2))
-    return R
 
 # --- Front camera calibration: orchestration only; the workflow lives in front_calibration ---
 
@@ -1020,51 +614,71 @@ def process_front_frame(frame):
     cv2.imshow("External Camera (Gaze)", frame)
 
 
-def reset_front_calibration():
+def unlock_eye_sphere(_):
+    global calibrated_sphere_center, last_sphere_center, last_gaze_dir
+    global sphere_center_locked_2d, locked_model_center_avg
+    calibrated_sphere_center = None
+    last_sphere_center = None
+    last_gaze_dir = None
+    sphere_center_locked_2d = False
+    locked_model_center_avg = prev_model_center_avg
+
+
+def reset_front_calibration(eye_ids=EYE_IDS):
+    """Clear the gaze calibration and unlock the eyes' spheres."""
     global last_marker
     clear_gaze_calibration()
     last_marker = None
-
-    def unlock(_):
-        global calibrated_sphere_center, last_sphere_center, last_gaze_dir
-        global sphere_center_locked_2d, locked_model_center_avg
-        calibrated_sphere_center = None
-        last_sphere_center = None
-        last_gaze_dir = None
-        sphere_center_locked_2d = False
-        locked_model_center_avg = prev_model_center_avg
-
-    for_all_eyes(unlock)
+    for_all_eyes(unlock_eye_sphere, eye_ids)
 
 
 
-def compute_gaze_vector(x, y, center_x, center_y, screen_width=640, screen_height=480):
-    """Gaze of the loaded eye from pupil and eyeball center pixels; records it for the outputs.
-    Returns:
-        sphere_center (np.ndarray): 3D position of the sphere center in world space
-        gaze_direction (np.ndarray): Normalized 3D direction vector from sphere center
-    """
-    global last_sphere_center, last_gaze_dir
-    sphere_center, gaze_rotated = gaze_vector_from_pixels(x, y, center_x, center_y, screen_width, screen_height)
-    last_sphere_center = sphere_center.copy()
-    last_gaze_dir = gaze_rotated.copy()
-    sphere_center_out = calibrated_sphere_center if calibrated_sphere_center is not None else sphere_center
-
-    # gaze_vector.txt is written once per frame for both eyes by write_gaze_vector_file().
-    eye_gaze_outputs[current_eye_id] = [float(v) for v in np.concatenate((sphere_center_out, gaze_rotated))]
-
-    return sphere_center_out, gaze_rotated
+# One EyeTracker per eye computes each frame from (and back into) the loaded eye's globals.
+eye_trackers = {eye_id: EyeTracker(eye_id) for eye_id in EYE_IDS}
 
 
 # Finds the pupil in an individual frame and returns the center point
 def process_frame(frame, return_rendered_frame=False):
-    observation = detect_pupil(frame)
-    frame = observation.frame
-    if observation.darkest_point is None:
+    """Track one frame of the loaded eye, then draw and show its eye view."""
+    global capture_frame_counter, stuck_ellipses
+    tracker = eye_trackers[current_eye_id]
+    tracker.set_state({name: globals()[name] for name in PER_EYE_STATE_NAMES})
+    result = tracker.process(frame)
+    globals().update(tracker.get_state())
+    if result.gaze_output is not None:
+        # gaze_vector.txt is written once per frame for both eyes by write_gaze_vector_file().
+        eye_gaze_outputs[current_eye_id] = result.gaze_output
+    if any(isinstance(event, CenterOverrideDone) for event in result.events):
+        # The gaze calibration was built from the old center, so start it over. This eye was
+        # unlocked in the middle of its frame; the others are unlocked now.
+        reset_front_calibration(tuple(eye_id for eye_id in EYE_IDS if eye_id != current_eye_id))
+        print("F resumes automatic eye sphere adjustment.")
+    frame = result.frame
+    if result.status == "no_dark_area":
         return (None, frame) if return_rendered_frame else None
 
-    final_rotated_rect = process_frames(observation)
-    
+    final_rotated_rect = result.ellipse if result.status == "ok" else None
+    # If capture mode is on, save one ellipse every N frames
+    if final_rotated_rect is not None and capture_stuck_ellipses:
+        capture_frame_counter += 1
+        if capture_frame_counter % ellipse_capture_interval == 0:
+            stuck_ellipses.append(final_rotated_rect)
+
+            # safety cap so list does not grow forever
+            if len(stuck_ellipses) > max_stuck_ellipses:
+                stuck_ellipses = stuck_ellipses[-max_stuck_ellipses:]
+
+    draw_eye_overlay(result, get_eye_sphere_adjustment_prompt(), stuck_ellipses)
+    cv2.imshow(eye_window_name("Frame with Ellipse and Rays"), frame)
+
+    # The single GL sphere window follows the left eye.
+    if final_rotated_rect is not None and GL_SPHERE_AVAILABLE and current_eye_id == "left":
+        center_x, center_y = result.pupil_center
+        gl_image = gl_sphere.update_sphere_rotation(center_x, center_y, result.model_center[0], result.model_center[1])
+        if gl_image is not None:
+            blended = cv2.addWeighted(frame, 0.6, gl_image, 0.4, 0)
+            cv2.imshow(eye_window_name("Tracker + Sphere"), blended)
+
     if return_rendered_frame:
         return final_rotated_rect, frame
 
@@ -1454,4 +1068,5 @@ def selection_gui():
 
 # Run GUI to select camera or video
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")  # gazecore's messages on the console
     selection_gui()
