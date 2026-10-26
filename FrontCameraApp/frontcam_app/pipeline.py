@@ -20,10 +20,13 @@ from gazecore import paths
 from gazecore.eye_overlay import draw_eye_overlay
 from gazecore.eye_tracker import CenterOverrideDone, EyeTracker
 
+from .capture_gates import cell_of
+
 EYE_IDS = ("left", "right")
 FRONT_SIZE = (640, 480)  # The front camera intrinsics are calibrated at this size
 EYE_FRESH_S = 0.2  # An older eye frame gives no gaze (that eye is offline)
 HISTORY_LENGTH = 120  # Frames kept for averaging calibration samples (~4 s)
+CHARUCO_VIEWS_PER_CELL = 2  # Lens views kept per cell of a 3x3 grid (3 once 6 cells have some)
 
 # Front camera modes
 FRONT_NONE, FRONT_MARKER, FRONT_CHARUCO = "none", "marker", "charuco"
@@ -52,6 +55,7 @@ class HistoryEntry:
     marker_generation: int  # Marker size version the detection used
     front_t: float  # Front frame timestamp, None without one
     eye_t: dict
+    marker_corners: np.ndarray = None  # (4, 2) image corners of the marker
 
 
 @dataclass
@@ -69,6 +73,8 @@ class Bundle:
     events: list = field(default_factory=list)
     processing_fps: float = 0.0
     screen: object = None  # ScreenGaze when the desktop overlay runs
+    history: tuple = ()  # Recent HistoryEntry items, oldest first (capture gates average them)
+    charuco_cells: dict = None  # {(row, column): views kept} during the lens calibration
 
 
 class Pipeline:
@@ -84,10 +90,12 @@ class Pipeline:
         self.marker_valid_from = 0.0
         self.front_mode = FRONT_MARKER
         self.intrinsics_calibrator = None
+        self.charuco_cells = {}
         self.screen_tracker = None  # Set while the desktop overlay runs (screen_geometry)
         self.gaze_vector_path = gaze_vector_path
         self.history = collections.deque(maxlen=HISTORY_LENGTH)
         self.seq = 0
+        self._last_eye = {}  # {eye: (packet seq, EyeResult)} of the last frame tracked
         self._fps_window = collections.deque(maxlen=30)
 
     # --- Commands (run on the worker thread between steps) ---
@@ -109,6 +117,26 @@ class Pipeline:
         self.marker_generation += 1
         self.marker_valid_from = (time.perf_counter() if now is None else now) + 0.3
 
+    def set_camera(self, camera):
+        """New front camera intrinsics: the marker poses and gaze mapping change with them."""
+        self.camera = camera
+        self.set_mapping(None)
+
+    def start_intrinsics(self, calibrator):
+        self.intrinsics_calibrator = calibrator
+        self.charuco_cells = {}
+        self.front_mode = FRONT_CHARUCO
+
+    def stop_intrinsics(self):
+        self.intrinsics_calibrator = None
+        self.front_mode = FRONT_MARKER
+
+    def _charuco_view_wanted(self, corners):
+        """A view counts as new only where the grid needs more, so the views spread over the image."""
+        row, column = cell_of(np.asarray(corners).reshape(-1, 2).mean(axis=0), FRONT_SIZE)
+        limit = CHARUCO_VIEWS_PER_CELL + (len(self.charuco_cells) >= 6)
+        return self.charuco_cells.get((row, column), 0) < limit, (row, column)
+
     def apply_eye_states(self, eye_states):
         for eye_id, state in eye_states.items():
             self.trackers[eye_id].apply_locked_state(state)
@@ -129,11 +157,14 @@ class Pipeline:
             if packet is None or now - packet.t > EYE_FRESH_S:
                 eyes[eye_id], gaze_dirs[eye_id], confidence[eye_id], eye_t[eye_id] = None, None, 0.0, None
                 continue
-            result = tracker.process(orient(packet.frame, self.bindings.get(eye_id)))
-            if result.gaze_output is not None:
-                self.gaze_outputs[eye_id] = result.gaze_output
-            events += result.events
-            draw_eye_overlay(result)
+            seen_seq, result = self._last_eye.get(eye_id, (None, None))
+            if packet.seq != seen_seq:  # A frame is tracked once: tracking changes the eye model
+                result = tracker.process(orient(packet.frame, self.bindings.get(eye_id)))
+                if result.gaze_output is not None:
+                    self.gaze_outputs[eye_id] = result.gaze_output
+                events += result.events
+                draw_eye_overlay(result)
+                self._last_eye[eye_id] = (packet.seq, result)
             eyes[eye_id] = result
             gaze_dirs[eye_id] = tracker.last_gaze_dir
             confidence[eye_id] = result.confidence if result.status == "ok" else 0.0
@@ -149,8 +180,17 @@ class Pipeline:
         if packet is not None:
             front = cv2.resize(orient(packet.frame, self.bindings.get("front")), FRONT_SIZE)
             if self.front_mode == FRONT_CHARUCO and self.intrinsics_calibrator is not None:
-                corners, ids = self.intrinsics_calibrator.add_frame(front, now)
-                charuco = None if ids is None else (corners, ids)
+                calibrator = self.intrinsics_calibrator
+                corners, ids, _, _ = calibrator.detector.detectBoard(front)
+                if ids is not None and corners is not None and len(ids) >= calibrator.min_corners:
+                    wanted, cell = self._charuco_view_wanted(corners)
+                    if wanted:  # add_frame detects again and applies its own corner and interval rules
+                        views = len(calibrator.views)
+                        corners, ids = calibrator.add_frame(front, now)
+                        if len(calibrator.views) > views:
+                            self.charuco_cells[cell] = self.charuco_cells.get(cell, 0) + 1
+                if ids is not None and corners is not None and len(ids) and len(ids) == len(corners):
+                    charuco = (np.asarray(corners, np.float32).reshape(-1, 1, 2), np.asarray(ids, np.int32).reshape(-1, 1))
             elif self.front_mode == FRONT_MARKER and packet.t >= self.marker_valid_from:
                 marker = self.marker_target.detect(front, self.camera)
         screen = None
@@ -160,7 +200,8 @@ class Pipeline:
         self.history.append(HistoryEntry(
             now, {eye: None if g is None else g.copy() for eye, g in gaze_dirs.items()}, confidence,
             None if marker is None else marker.point, None if marker is None else marker.pixel,
-            self.marker_generation, None if packet is None else packet.t, eye_t))
+            self.marker_generation, None if packet is None else packet.t, eye_t,
+            None if marker is None else marker.corners.reshape(4, 2)))
         self.write_gaze_vector(estimate)
 
         self.seq += 1
@@ -169,7 +210,8 @@ class Pipeline:
             1e-6, self._fps_window[-1] - self._fps_window[0])
         return Bundle(now, self.seq, eyes, front, marker, estimate, charuco,
                       0 if self.intrinsics_calibrator is None else len(self.intrinsics_calibrator.views),
-                      events, fps, screen)
+                      events, fps, screen, tuple(self.history),
+                      dict(self.charuco_cells) if self.front_mode == FRONT_CHARUCO else None)
 
     def write_gaze_vector(self, estimate):
         """CSV: left origin+direction, right origin+direction (eye model units), then the

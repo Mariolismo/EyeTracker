@@ -88,6 +88,11 @@ def evaluate(live, front, gaze, gaze_solves):
             validity.first_step = "eye:" + changed[0]
             validity.reasons.append(f"The {changed[0]} eye camera's orientation changed since calibrating")
             return validity
+        lens_date = (front.app_meta or {}).get("calibrated_at")
+        if lens_date and (gaze.saved_at or "") < lens_date:  # ISO timestamps sort in time order
+            validity.first_step = GAZE
+            validity.reasons.append("The front camera's lens was recalibrated since the gaze calibration")
+            return validity
         validity.legacy = True
     else:
         for eye in EYE_IDS:

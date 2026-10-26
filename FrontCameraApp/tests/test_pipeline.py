@@ -19,8 +19,8 @@ from gazecore.tests.golden import eye_golden
 LOCK_AT, COMPARE_UNTIL = 120, 160  # Golden run B locks both eyes at 120 and overrides the right eye at 160
 
 
-def packet(frame, t):
-    return FramePacket(0, t, frame, (frame.shape[1], frame.shape[0]))
+def packet(frame, t, seq=0):
+    return FramePacket(seq, t, frame, (frame.shape[1], frame.shape[0]))
 
 
 def test_pipeline_reproduces_golden_run_b():
@@ -37,7 +37,8 @@ def test_pipeline_reproduces_golden_run_b():
             for tracker in pipeline.trackers.values():
                 tracker.lock_sphere()
         t = float(index)
-        bundle = pipeline.step({"left": packet(frame, t), "right": packet(cv2.resize(frame, (1280, 720)), t)}, now=t)
+        bundle = pipeline.step({"left": packet(frame, t, index + 1),
+                                "right": packet(cv2.resize(frame, (1280, 720)), t, index + 1)}, now=t)
         for eye in ("left", "right"):
             rows[eye].append(eye_golden.vector(pipeline.trackers[eye].last_gaze_dir, 3)
                              + eye_golden.vector(pipeline.gaze_outputs[eye], 6))
@@ -123,3 +124,23 @@ def test_files_written_with_metadata_still_load_in_the_tracker_format():
         loaded, loaded_states, _ = fc.load_gaze_session(extended)  # what the tracker calls
         assert loaded_states == states and len(loaded.samples) == len(calibration.samples)
         assert store.load_gaze(extended).app_meta == {"version": 1}
+
+
+def test_a_legacy_gaze_calibration_older_than_the_lens_is_refused():
+    gaze = stored()
+    gaze.saved_at = "2026-10-01T10:00:00"
+    front = store.FrontCalibration(calibrated_camera(), {}, {"front": LIVE["front"], "calibrated_at": "2026-10-20T09:00:00"})
+    assert v.evaluate(LIVE, front, gaze, True).first_step == v.GAZE
+    front.app_meta["calibrated_at"] = "2026-09-01T09:00:00"
+    assert v.evaluate(LIVE, front, gaze, True).ok
+
+
+def test_lens_views_spread_over_the_image():
+    pipeline = Pipeline(rendered.CAMERA, gaze_vector_path=None)
+    pipeline.start_intrinsics(fc.IntrinsicsCalibrator((640, 480), min_interval_s=0.0))
+    board = pipeline.intrinsics_calibrator.board_image((700, 500), margin=20)
+    frame = rendered.render_plane(board, (0.21, 0.15), np.eye(3), np.array([0.0, 0.0, 0.35]), background=255)
+    for i in range(6):  # The same view again and again: only the first ones count
+        bundle = pipeline.step({"front": packet(frame, float(i), i + 1)}, now=float(i))
+    assert bundle.intrinsics_views == 2 and sum(bundle.charuco_cells.values()) == 2
+    assert bundle.charuco is not None

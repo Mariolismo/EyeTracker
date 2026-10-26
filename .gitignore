@@ -6,3 +6,8 @@ FrontCameraTracker/front_camera_calibration.json
 FrontCameraTracker/gaze_calibration.json
 FrontCameraTracker/calibration_samples.json
 FrontCameraTracker/calibrations/
+
+# Front-camera app: per-machine settings, session exports and logs
+FrontCameraApp/settings/
+FrontCameraApp/sessions/
+FrontCameraApp/logs/
