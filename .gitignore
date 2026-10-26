@@ -1,0 +1,8 @@
+__pycache__/
+gaze_vector.txt
+
+# Per-headset calibration data, written by the front-camera tracker
+FrontCameraTracker/front_camera_calibration.json
+FrontCameraTracker/gaze_calibration.json
+FrontCameraTracker/calibration_samples.json
+FrontCameraTracker/calibrations/
