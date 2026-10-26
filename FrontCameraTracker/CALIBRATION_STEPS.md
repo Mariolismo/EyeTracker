@@ -1,5 +1,9 @@
 # Calibration steps (using a monitor, no printing)
 
+> **New:** the front camera app (`python FrontCameraApp/run_app.py`) walks you through all of
+> this in a wizard and checks each step for you. See [FrontCameraApp/USER_GUIDE.md](../FrontCameraApp/USER_GUIDE.md).
+> The steps below are for the original tracker, which still works with the same files.
+
 What you need: the headset (left eye, right eye and front cameras), a monitor and a ruler.
 
 > **When do I measure?** Only the size of the black square on the screen, with a ruler,

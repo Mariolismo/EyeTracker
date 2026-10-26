@@ -1,0 +1,5 @@
+numpy==2.1.2
+# Pinned: the golden eye-pipeline test depends on this version's video decoder (frame CRCs)
+opencv-python==5.0.0.93
+PyQt5==5.15.11
+pytest==8.3.3

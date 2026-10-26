@@ -32,3 +32,14 @@ Fork of [JEOresearch/EyeTracker](https://github.com/JEOresearch/EyeTracker), hos
 - **Problem:** the fitted eye origins are asymmetric (22 mm height difference, midpoint 14 mm right of the camera), although the eyes sit symmetrically around the front camera.
 - **Tried:** refits with symmetric constraints on the same samples, plus a synthetic headset with asymmetric eye cameras.
 - **Result:** the height split is noise. The sideways shift comes from the eye-camera non-linearity, because NEAR and FAR samples covered different gaze angles. It cancels near the calibration conditions but not when extrapolating. Plan for when we design CAD glasses: `FrontCameraTracker/FUTURE_CAD_HEADSET_PLAN.md`.
+
+### Front camera app (PyQt5) on a shared `gazecore` package
+- **Problem:** the front-camera tracker's math works, but its app doesn't. One 2010-line Tk + cv2 file, camera reads blocking the UI, a slow index probe at startup, camera choices forgotten, keys only in cv2 windows, status in the terminal, a camera stop or flip silently clearing the calibration, a silent solve, and the marker measured with a ruler.
+- **Tried:** a new app beside the old tracker (`FrontCameraApp/`, guide in `FrontCameraApp/USER_GUIDE.md`), with **no tracking math changes**.
+  - First a golden test recorded today's eye pipeline frame by frame (tag `golden-baseline`). Then the shared code moved into `gazecore/` and the per-eye logic became an `EyeTracker` class; both reproduce it bit for bit, and the old tracker now runs on it.
+  - Cameras are matched by device ID, opened one at a time, read on their own threads, and reconnected by a watchdog.
+  - The app goes straight to tracking when the calibration still matches the cameras, otherwise to a wizard at the first missing step. It covers screen scale, lens, each eye, near/far gaze with plain-language capture gates, an explicit solve and a review before anything is saved. Extra information goes under an `app_meta` key, so the old tracker still reads the files.
+  - A desktop overlay shows the gaze ring and a heatmap on the monitor, from corner markers and the eye rays.
+- **Fixed during development:** IPPE alone left the screen pose ~3° off when seen square-on; each candidate is now refined with LM (0.13°, ~2 mm on the screen in the synthetic test). A gaze file from the old tracker that is older than a lens calibration made by the app is now refused.
+- **Result:** 65 tests pass, including both golden tests. Offscreen on video files, the existing calibration opens tracking directly (24 fps processed), and every page and the overlay run. Not run on the rig yet.
+- **Still to improve:** everything on the rig. That means a full wizard run (target ~0.84°/0.95°, 66 mm), V accuracy against the old tracker, both capture modes and a clicker at 2 m. For the overlay, the corner and center error in mm at 0.6 m, pose dropouts and repaint cost.
