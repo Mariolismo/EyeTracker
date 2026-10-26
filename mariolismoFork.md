@@ -27,3 +27,8 @@ Fork of [JEOresearch/EyeTracker](https://github.com/JEOresearch/EyeTracker), hos
   - Samples got lost when a new session started. Each session is now saved to `calibrations/gaze_<date>_<time>.json`, the last good one to `gaze_calibration.json`, and it is restored at startup (or with L), including the locked eye centers.
 - **Result:** 14 samples, one bad far sample dropped automatically. RMS 0.84° (L) and 0.95° (R), against 1.63° and 2.72° for the no-offset model on the same samples. Eye separation 66 mm. Works well in live use.
 - **Still to improve:** it solves silently as soon as both groups have 6 samples, which is easy to miss, and C after that starts over.
+
+### Implausible eye origins (parked for a CAD headset)
+- **Problem:** the fitted eye origins are asymmetric (22 mm height difference, midpoint 14 mm right of the camera), although the eyes sit symmetrically around the front camera.
+- **Tried:** refits with symmetric constraints on the same samples, plus a synthetic headset with asymmetric eye cameras.
+- **Result:** the height split is noise. The sideways shift comes from the eye-camera non-linearity, because NEAR and FAR samples covered different gaze angles. It cancels near the calibration conditions but not when extrapolating. Plan for when we design CAD glasses: `FrontCameraTracker/FUTURE_CAD_HEADSET_PLAN.md`.
