@@ -11,10 +11,11 @@ import cv2
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import Orlosky3DEyeTrackerFrontCamera as tracker  # noqa: E402
-import test_front_calibration as rendered  # noqa: E402
-import test_gaze_geometry as syn  # noqa: E402
+from gazecore.tests import test_front_calibration as rendered  # noqa: E402
+from gazecore.tests import test_gaze_geometry as syn  # noqa: E402
 
 EYE_VIDEO = os.path.join(os.path.dirname(HERE), "eye_test.mp4")
 

@@ -7,7 +7,7 @@ from the code itself and can be reproduced with the commands in §11.
 |---|---|---|
 | [`gaze_geometry.py`](gaze_geometry.py) | The math: eye model, fitting, triangulation, depth filter, projection (§3–§9) | numpy (cv2 only for lens distortion) |
 | [`front_calibration.py`](front_calibration.py) | The workflow: camera model and file, ArUco target, ChArUco intrinsics, sample collection and solve, runtime mapping, accuracy test. No UI, no globals. | `gaze_geometry`, numpy, OpenCV ≥ 4.7 |
-| [`Orlosky3DEyeTrackerFrontCamera.py`](Orlosky3DEyeTrackerFrontCamera.py) | Pupil tracking per eye, GUI, keys, drawing; connects the two modules above | all of the above, tkinter |
+| [`Orlosky3DEyeTrackerFrontCamera.py`](../FrontCameraTracker/Orlosky3DEyeTrackerFrontCamera.py) | Pupil tracking per eye, GUI, keys, drawing; connects the two modules above | all of the above, tkinter |
 
 ---
 
@@ -339,7 +339,7 @@ parallax. If the two eyes' errors are independent, $\delta\theta$ is about $\sqr
 
 ## 10. Worked numeric example (end to end)
 
-The synthetic headset is the one in [`test_gaze_geometry.py`](test_gaze_geometry.py).
+The synthetic headset is the one in [`test_gaze_geometry.py`](tests/test_gaze_geometry.py).
 
 **Ground truth**
 
@@ -417,10 +417,10 @@ after 9 NEAR + 6 FAR samples, RMS 0.25° / 0.20°, eye separation 64 mm. The acc
 ## 11. Reproducing
 
 ```sh
-python -m pytest FrontCameraTracker            # everything (each file also runs as a plain script)
-python FrontCameraTracker/test_gaze_geometry.py        # math, numpy only
-python FrontCameraTracker/test_front_calibration.py    # workflow on rendered ArUco/ChArUco images
-python FrontCameraTracker/test_tracker_integration.py  # tracker orchestration, headless, + eye video
+python -m pytest                                      # everything (each file also runs as a plain script)
+python gazecore/tests/test_gaze_geometry.py           # math, numpy only
+python gazecore/tests/test_front_calibration.py       # workflow on rendered ArUco/ChArUco images
+python FrontCameraTracker/test_tracker_integration.py # tracker orchestration, headless, + eye video
 ```
 
 Step 6 is `test_tracker_integration.py::test_calibration_flow_through_tracker`.

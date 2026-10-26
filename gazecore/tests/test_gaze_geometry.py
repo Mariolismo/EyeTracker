@@ -1,4 +1,4 @@
-"""Synthetic checks for gaze_geometry. Run: python FrontCameraTracker/test_gaze_geometry.py"""
+"""Synthetic checks for gaze_geometry. Run: python gazecore/tests/test_gaze_geometry.py"""
 
 import math
 import os
@@ -6,8 +6,8 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import gaze_geometry as gg  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from gazecore import gaze_geometry as gg  # noqa: E402
 
 RNG = np.random.default_rng(7)
 K = gg.default_intrinsics(640, 480, 60.0)

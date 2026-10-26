@@ -21,7 +21,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-import gaze_geometry as gg
+from . import gaze_geometry as gg
 
 # The gaze target and the intrinsics board use different dictionaries,
 # so board markers are never mistaken for the target.

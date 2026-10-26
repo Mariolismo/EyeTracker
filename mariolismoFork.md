@@ -18,7 +18,7 @@ Fork of [JEOresearch/EyeTracker](https://github.com/JEOresearch/EyeTracker), hos
 
 ### Parallax-free gaze: two eyes + ArUco marker
 - **Problem:** the 5-point finger calibration maps gaze direction to a front-camera pixel with a 2×2 matrix and ignores the eye→camera offset, so it is exact only at the calibration depth (~40 cm) and drifts by |offset|·|1/Z − 1/Z₀| elsewhere. One eye at one depth can't separate the offset from a small rotation.
-- **Tried:** a per-eye ray model (3×3 gain + 3D origin) fitted on ArUco marker positions at two depths (NEAR < 0.6 m, FAR > 1.5 m), with binocular triangulation and an inverse-depth filter at runtime. Math in `FrontCameraTracker/GAZE_GEOMETRY.md`, user steps in `FrontCameraTracker/CALIBRATION_STEPS.md`. The code is split into `gaze_geometry.py` (pure math), `front_calibration.py` (camera, marker, ChArUco intrinsics, files) and the tracker (GUI and orchestration), with synthetic, rendered-image and headless tests.
+- **Tried:** a per-eye ray model (3×3 gain + 3D origin) fitted on ArUco marker positions at two depths (NEAR < 0.6 m, FAR > 1.5 m), with binocular triangulation and an inverse-depth filter at runtime. Math in `gazecore/GAZE_GEOMETRY.md` (then in `FrontCameraTracker/`), user steps in `FrontCameraTracker/CALIBRATION_STEPS.md`. The code is split into `gaze_geometry.py` (pure math), `front_calibration.py` (camera, marker, ChArUco intrinsics, files) and the tracker (GUI and orchestration), with synthetic, rendered-image and headless tests.
 - **Fixed on the live rig:**
   - OpenCV 5 returns ChArUco corners as (N, 2), which crashed the drawing; reshaped.
   - The lens calibration overfit with few views (corner distortion factor 0.37). Now k1/k2 only, plus a plausibility check.

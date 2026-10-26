@@ -186,8 +186,8 @@ def run_b(tracker, frames, probe, models, camera):
 
 def synthetic_models():
     """Deterministic per-eye ray models (noise-free rendered calibration)."""
-    sys.path.insert(0, TRACKER_DIR)
-    import test_front_calibration as rendered
+    sys.path.insert(0, REPO)
+    from gazecore.tests import test_front_calibration as rendered
     _, result = rendered.calibrate_with_rendered_marker([0.4, 2.0], noise=0.0)
     return result.models, rendered.CAMERA
 

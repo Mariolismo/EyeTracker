@@ -1,6 +1,6 @@
 """Integration tests for front_calibration with rendered ArUco/ChArUco images and synthetic eyes.
 
-Run: python FrontCameraTracker/test_front_calibration.py   (or pytest)
+Run: python gazecore/tests/test_front_calibration.py   (or pytest)
 """
 
 import math
@@ -11,10 +11,10 @@ import tempfile
 import cv2
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import front_calibration as fc  # noqa: E402
-import gaze_geometry as gg  # noqa: E402
-import test_gaze_geometry as syn  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from gazecore import front_calibration as fc  # noqa: E402
+from gazecore import gaze_geometry as gg  # noqa: E402
+from gazecore.tests import test_gaze_geometry as syn  # noqa: E402
 
 IMAGE_SIZE = (640, 480)
 CAMERA = fc.CameraModel.from_fov(IMAGE_SIZE, 60.0)

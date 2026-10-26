@@ -22,8 +22,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
 sys.path.insert(0, SCRIPT_DIR)
 
-import front_calibration as fc
-import gaze_geometry as gg
+from gazecore import front_calibration as fc
+from gazecore import gaze_geometry as gg
+from gazecore import paths
 
 try:
     import gl_sphere
@@ -97,11 +98,11 @@ EXT_CY = EXT_HEIGHT // 2
 FRONT_DIAGONAL_FOV_DEGREES = 60.0  # Fallback pinhole model until intrinsics are calibrated
 
 # Front camera model and fitted eye offsets persist per headset (see front_calibration).
-CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "front_camera_calibration.json")
+CALIBRATION_FILE = paths.CALIBRATION_FILE
 # The last successful gaze calibration, restored when the cameras start (or with L).
-GAZE_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "gaze_calibration.json")
+GAZE_CALIBRATION_FILE = paths.GAZE_CALIBRATION_FILE
 # Every capture session, successful or not, for analysis and recovery.
-GAZE_SESSIONS_DIR = os.path.join(SCRIPT_DIR, "calibrations")
+GAZE_SESSIONS_DIR = paths.GAZE_SESSIONS_DIR
 gaze_session_file = None  # Timestamped file of the session being captured
 front_camera = fc.CameraModel.from_fov((EXT_WIDTH, EXT_HEIGHT), FRONT_DIAGONAL_FOV_DEGREES)
 saved_eye_origins = {}
@@ -1282,7 +1283,7 @@ def solve_gaze_calibration(save=True):
 def write_gaze_vector_file():
     """CSV: left origin+direction, right origin+direction (eye model units), then the
     gaze point (front camera frame, metres) and its depth; zeros when unavailable."""
-    file_path = "gaze_vector.txt"
+    file_path = paths.GAZE_VECTOR_FILE
     try:
         with open(file_path, "a"):
             pass
