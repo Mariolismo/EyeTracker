@@ -49,7 +49,7 @@ class HistoryEntry:
 
     t: float
     gaze: dict  # {eye: raw gaze or None}
-    confidence: dict  # {eye: pupil confidence, 0 when not tracked}
+    confidence: dict  # {eye: pupil quality (EyeResult.quality), 0 when not tracked}
     marker_point: np.ndarray  # Marker center in the front camera frame (m), or None
     marker_pixel: np.ndarray
     marker_generation: int  # Marker size version the detection used
@@ -163,11 +163,11 @@ class Pipeline:
                 if result.gaze_output is not None:
                     self.gaze_outputs[eye_id] = result.gaze_output
                 events += result.events
-                draw_eye_overlay(result)
+                draw_eye_overlay(result, show_quality=True)
                 self._last_eye[eye_id] = (packet.seq, result)
             eyes[eye_id] = result
             gaze_dirs[eye_id] = tracker.last_gaze_dir
-            confidence[eye_id] = result.confidence if result.status == "ok" else 0.0
+            confidence[eye_id] = result.quality if result.status == "ok" else 0.0
             eye_t[eye_id] = packet.t
         if any(isinstance(event, CenterOverrideDone) for event in events):
             self.set_mapping(None)  # Built from the old eye center; the controller decides what next

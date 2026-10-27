@@ -34,6 +34,7 @@ the processed frame rate, and the calibration's accuracy, eye separation and age
 | **C** | Cameras |
 | **O** | Desktop overlay (gaze ring and heatmap on the monitor) |
 | **H** | Heatmap on/off |
+| **X** | Record the tracking view to `sessions/tracking_<time>.mp4`, with a CSV of gaze pixel, depth, pupil confidence and pupil quality per frame (X again stops) |
 | **F1** | Help |
 | **Q** | Quit |
 
@@ -63,8 +64,9 @@ A bar at the top shows the steps. **Esc** goes back one step.
      camera's lens until it finishes, then **L**.
    - Optional: **T**, then close that eye for a second. It confirms the cameras aren't swapped.
 5. **Gaze, near then far.** A marker appears on the screen.
-   - **Near:** stand closer than 0.6 m. Look at the marker's center and capture. The marker
-     moves after each sample. Aim for 9 samples (at least 6, over 2 rows and 2 columns of
+   - **Near:** stand closer than 0.6 m. Look at the marker's center and capture. Turn your
+     head between samples so the marker lands in each square of the grid (Tab moves the
+     marker if you need it elsewhere). Aim for 9 samples (at least 6, over 2 rows and 2 columns of
      the grid).
    - **N** switches to **far:** stand farther than 1.5 m. The marker gets bigger. Turn your
      head so it lands in each square of the grid.

@@ -3,6 +3,10 @@
 Both capture modes use the same gates: manual capture refuses with the first failure's text,
 dwell capture fills its ring only while everything passes. A sample is the average of the
 window (frames_averaged entries; 1 restores the tracker's single-frame capture).
+
+Noisy frames are read and discarded rather than failing the whole window: a frame is kept when
+both pupils are confident, then frames whose gaze strays from the window's median are dropped.
+The window passes when enough frames survive; the sample averages only those.
 """
 
 from dataclasses import dataclass, field
@@ -11,8 +15,9 @@ import numpy as np
 
 from gazecore import gaze_geometry as gg
 
-MIN_CONFIDENCE = 0.85
-CONFIDENT_SHARE = 0.9  # Of the window
+MIN_CONFIDENCE = 0.75  # Pupil quality (gazecore pupil_quality): lash fits stay under about 0.65
+MIN_KEPT_SHARE = 0.5  # Of the window: frames with both pupils confident (blinks are dropped)
+OUTLIER_DEG = 1.5  # Frames whose gaze is this far from the window's median direction are dropped
 MARKER_SHARE = 0.9
 MAX_GAZE_STD_DEG = 0.75
 MAX_MARKER_STD_PX = 3.0
@@ -33,13 +38,14 @@ class Sample:
     frames: int
     gaze_std_deg: dict
     marker_std_px: float
+    dropped: int = 0  # Window frames discarded (low confidence, no gaze, outliers)
 
     @property
     def depth(self):
         return float(self.point[2])
 
     def meta(self):
-        return {"t": round(self.t, 3), "frames": self.frames, "depth_m": round(self.depth, 3),
+        return {"t": round(self.t, 3), "frames": self.frames, "dropped": self.dropped, "depth_m": round(self.depth, 3),
                 "gaze_std_deg": {eye: round(v, 3) for eye, v in self.gaze_std_deg.items()},
                 "marker_std_px": round(self.marker_std_px, 2)}
 
@@ -49,6 +55,7 @@ class GateResult:
     failures: list = field(default_factory=list)  # Plain language, most fundamental first
     sample: Sample = None
     window_fill: float = 0.0  # 0..1: how much of the window is collected (for "hold still")
+    stats: dict = field(default_factory=dict)  # Per-window numbers for the debug log
 
     @property
     def ok(self):
@@ -84,6 +91,17 @@ def _angular_std_deg(directions):
     mean = gg.unit(np.mean(directions, axis=0))
     errors = gg.angular_errors_degrees(directions, np.repeat(mean[None], len(directions), axis=0))
     return mean, float(np.sqrt(np.mean(errors ** 2)))
+
+
+def _drop_gaze_outliers(entries):
+    """Keep the entries whose gaze is within OUTLIER_DEG of the median direction, for both eyes."""
+    keep = np.ones(len(entries), dtype=bool)
+    for eye in EYE_IDS:
+        directions = np.array([e.gaze[eye] for e in entries])
+        median = gg.unit(np.median(directions, axis=0))
+        errors = gg.angular_errors_degrees(directions, np.repeat(median[None], len(directions), axis=0))
+        keep &= np.asarray(errors) <= OUTLIER_DEG
+    return [e for e, k in zip(entries, keep) if k]
 
 
 def _clear_of_edges(corners, image_size):
@@ -123,48 +141,55 @@ def evaluate(history, context, camera=None):
             result.failures.append(f"Move back: {depth:.2f} m, need over {gg.FAR_BAND_MIN_M} m")
         return result
 
-    for eye in EYE_IDS:
-        confident = sum(1 for e in window if e.confidence.get(eye, 0.0) >= MIN_CONFIDENCE and e.gaze.get(eye) is not None)
-        if confident < CONFIDENT_SHARE * len(window):
-            result.failures.append(f"The {eye} pupil is not tracked steadily (blinking? lighting?)")
-            return result
+    need = max(1, int(np.ceil(MIN_KEPT_SHARE * len(window))))
+    confident = {eye: [e for e in with_marker if e.confidence.get(eye, 0.0) >= MIN_CONFIDENCE
+                       and e.gaze.get(eye) is not None] for eye in EYE_IDS}
+    kept = [e for e in with_marker if all(e in confident[eye] for eye in EYE_IDS)]
+    result.stats = {"window": len(window), "marker": len(with_marker), "kept": len(kept),
+                    **{f"{eye}_confident": len(confident[eye]) for eye in EYE_IDS},
+                    **{f"{eye}_median_conf": round(float(np.median([e.confidence.get(eye, 0.0) for e in window])), 2)
+                       for eye in EYE_IDS}}
+    if len(kept) < need:
+        worst = min(EYE_IDS, key=lambda eye: len(confident[eye]))
+        result.failures.append(
+            f"The {worst} pupil is not tracked steadily: {len(confident[worst])}/{len(window)} frames with pupil quality over "
+            f"{MIN_CONFIDENCE:.2f} (median {result.stats[f'{worst}_median_conf']:.2f}), need {need} with both eyes")
+        return result
 
-    skewed = 0
-    for e in with_marker:
-        for eye in EYE_IDS:
-            eye_t = e.eye_t.get(eye)
-            if e.front_t is None or eye_t is None or abs(e.front_t - eye_t) > MAX_FRAME_SKEW_S:
-                skewed += 1
-                break
-    if skewed > (1 - MARKER_SHARE) * len(with_marker):
+    kept = [e for e in kept if e.front_t is not None and all(
+        e.eye_t.get(eye) is not None and abs(e.front_t - e.eye_t[eye]) <= MAX_FRAME_SKEW_S for eye in EYE_IDS)]
+    if len(kept) < need:
         result.failures.append("The cameras' frames are out of step (a camera is lagging)")
         return result
 
-    usable = [e for e in with_marker if all(e.gaze.get(eye) is not None for eye in EYE_IDS)]
-    if not usable:
-        result.failures.append("No gaze from both eyes")
+    kept = _drop_gaze_outliers(kept)
+    result.stats["after_outliers"] = len(kept)
+    if len(kept) < need:
+        result.failures.append(f"Keep your eyes on the marker's center (gaze jumps: {len(kept)}/{len(window)} frames steady)")
         return result
     gaze, gaze_std = {}, {}
     for eye in EYE_IDS:
-        gaze[eye], gaze_std[eye] = _angular_std_deg(np.array([e.gaze[eye] for e in usable]))
+        gaze[eye], gaze_std[eye] = _angular_std_deg(np.array([e.gaze[eye] for e in kept]))
+    result.stats["gaze_std_deg"] = {eye: round(v, 3) for eye, v in gaze_std.items()}
     worst = max(gaze_std, key=gaze_std.get)
     if gaze_std[worst] > MAX_GAZE_STD_DEG:
         result.failures.append(f"Keep your eyes on the marker's center ({worst} eye wanders {gaze_std[worst]:.1f}°)")
         return result
-    pixels = np.array([e.marker_pixel for e in with_marker])
+    pixels = np.array([e.marker_pixel for e in kept])
     mean_pixel = pixels.mean(axis=0)
     marker_std = float(np.sqrt(np.mean(np.sum((pixels - mean_pixel) ** 2, axis=1))))
     if marker_std > MAX_MARKER_STD_PX:
         result.failures.append("Hold your head still")
         return result
 
-    point = points.mean(axis=0)
+    point = np.mean([e.marker_point for e in kept], axis=0)
     pixel = mean_pixel if camera is None else np.asarray(camera.project(point), dtype=float)
     for earlier in context.earlier_pixels:
         if np.linalg.norm(np.asarray(earlier) - pixel) < MIN_SAMPLE_SPACING_PX:
             result.failures.append("Already have a sample here: put the marker somewhere new in the view")
             return result
-    result.sample = Sample(gaze, point, pixel, window[-1].t, len(usable), gaze_std, marker_std)
+    result.sample = Sample(gaze, point, pixel, window[-1].t, len(kept), gaze_std, marker_std,
+                           dropped=len(window) - len(kept))
     return result
 
 

@@ -67,6 +67,19 @@ def test_each_gate_explains_itself():
         assert not result.ok and expected in result.failures[0], (expected, result.failures)
 
 
+def test_blinks_and_gaze_jumps_are_dropped_not_fatal():
+    near = target(320, 240, 0.45)
+    history = entries(near)
+    for i in range(0, 30, 3):  # A third of the frames: blinks, with garbage gaze
+        history[i].confidence["left"] = 0.3
+        history[i].gaze["left"] = syn.raw_gaze("left", target(100, 100, 0.45))
+    history[1].gaze["right"] = syn.raw_gaze("right", target(500, 400, 0.45))  # One confident glitch
+    result = gates.evaluate(history, gates.GateContext(), CAMERA)
+    assert result.ok, result.failures
+    assert result.sample.frames == 19 and result.sample.dropped == 11
+    assert max(result.sample.gaze_std_deg.values()) < 0.1
+
+
 def test_single_frame_capture_like_the_tracker():
     result = gates.evaluate(entries(target(320, 240, 0.45), count=1), gates.GateContext(window=1), CAMERA)
     assert result.ok and result.sample.frames == 1

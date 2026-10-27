@@ -2,7 +2,7 @@
 with a heads-up display big enough to read from 2 m.
 
 Layout: instructions across the top, the depth gauge on the left, coverage grid and pupil
-bars bottom-left, the front camera bottom-right. The target sits in the middle region, so
+bars bottom-left, the front camera bottom-right with the two eye views above it. The target sits in the middle region, so
 the HUD never covers its white quiet zone.
 """
 
@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import QWidget
 from gazecore import front_calibration as fc
 from gazecore import gaze_geometry as gg
 
+from .. import capture_gates
 from .common import fit_rect, to_qimage
 
 GAUGE_RANGE_M = (0.2, 3.0)
@@ -48,6 +49,7 @@ class TargetCanvas(QWidget):
         self.confidence = {}  # {eye: 0..1}
         self.front = None  # QImage of the front camera
         self.front_marks = []  # [(points (N, 2) in front pixels, QColor)] drawn on the inset
+        self.eyes = {}  # {eye: QImage of the drawn eye view, or None}
 
     # --- State ---
 
@@ -59,6 +61,9 @@ class TargetCanvas(QWidget):
 
     def set_front(self, frame):
         self.front = to_qimage(frame)
+
+    def set_eyes(self, frames):
+        self.eyes = {eye: to_qimage(frame) for eye, frame in frames.items()}
 
     def free_area(self):
         """Where targets may go (widget px): clear of the HUD."""
@@ -90,6 +95,7 @@ class TargetCanvas(QWidget):
         self._paint_grid(p)
         self._paint_confidence(p)
         self._paint_front(p)
+        self._paint_eyes(p)
         p.end()
 
     def _font(self, fraction, bold=False):
@@ -163,7 +169,7 @@ class TargetCanvas(QWidget):
             value = float(self.confidence.get(eye, 0.0))
             x = x0 + i * bar_w * 2.4
             p.fillRect(QRectF(x, y0, bar_w, bar_h), QColor(225, 225, 225))
-            colour = OK_COLOUR if value >= 0.85 else BAD_COLOUR
+            colour = OK_COLOUR if value >= capture_gates.MIN_CONFIDENCE else BAD_COLOUR
             p.fillRect(QRectF(x, y0 + bar_h * (1 - value), bar_w, bar_h * value), colour)
             p.setPen(TEXT)
             p.drawText(QRectF(x - 10, y0 + bar_h + 2, bar_w + 20, 22), Qt.AlignCenter, eye[0].upper())
@@ -185,6 +191,28 @@ class TargetCanvas(QWidget):
                     p.drawEllipse(pt, 3, 3)
         p.setPen(QPen(TEXT, 2))
         p.drawRect(rect)
+
+
+    def _paint_eyes(self, p):
+        """Left and right eye views side by side above the front camera: what the pupil fit sees."""
+        w, h = self.width(), self.height()
+        top, height, width = h * 0.29, h * 0.31, w * 0.113
+        p.setFont(self._font(0.018, bold=True))
+        for i, eye in enumerate(("left", "right")):
+            area = QRectF(w * 0.76 + i * (width + w * 0.004), top, width, height)
+            image = self.eyes.get(eye)
+            rect = fit_rect(4, 3, area) if image is None else fit_rect(image.width(), image.height(), area)
+            value = float(self.confidence.get(eye, 0.0))
+            if image is None:
+                p.fillRect(rect, QColor(60, 60, 60))
+            else:
+                p.drawImage(rect, image)
+            p.setPen(QPen(OK_COLOUR if value >= capture_gates.MIN_CONFIDENCE else BAD_COLOUR, 4))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(rect)
+            p.setPen(TEXT)
+            p.drawText(QRectF(rect.x(), rect.bottom() + 2, rect.width(), 24), Qt.AlignCenter,
+                       f"{eye.title()} {value:.0%}" if image is not None else f"{eye.title()}: no frame")
 
 
 def board_qimage(calibrator, max_width, max_height):

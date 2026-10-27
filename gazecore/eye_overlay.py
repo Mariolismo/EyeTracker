@@ -7,11 +7,12 @@ frames are unchanged (gazecore/tests/golden checks their CRCs).
 import cv2
 
 
-def draw_eye_overlay(result, prompt=None, stuck_ellipses=()):
+def draw_eye_overlay(result, prompt=None, stuck_ellipses=(), show_quality=False):
     """Draw on result.frame (the 640x480 eye frame) in place and return it.
 
     prompt: the instruction line at the bottom (None draws none). stuck_ellipses: earlier pupil
-    ellipses kept on screen (the tracker's E capture).
+    ellipses kept on screen (the tracker's E capture). show_quality: the corner percentage is
+    result.quality instead of the original confidence.
     """
     frame = result.frame
     if result.status == "no_dark_area":
@@ -42,7 +43,7 @@ def draw_eye_overlay(result, prompt=None, stuck_ellipses=()):
     extended_y = int(model_center_average[1] + 2 * dy)
     cv2.line(frame, (center_x, center_y), (extended_x, extended_y), (200, 255, 0), 3)
 
-    ratio_text = f"{result.confidence * 100:.2f}%"
+    ratio_text = f"{(result.quality if show_quality else result.confidence) * 100:.2f}%"
     cv2.putText(frame, ratio_text, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
     cv2.putText(frame, ratio_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 

@@ -4,8 +4,8 @@ A valid calibration must go straight to tracking; without a lens calibration the
 open at the lens step. Every page is shown, fed and painted on the way.
 """
 
+import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,8 +46,13 @@ def test_a_valid_calibration_goes_straight_to_tracking():
         return
     with tempfile.TemporaryDirectory() as folder:
         os.makedirs(os.path.join(folder, "data"))
+        # As legacy files: once the app has saved there, app_meta names the real USB cameras, not the videos
         for name in ("front_camera_calibration.json", "gaze_calibration.json"):
-            shutil.copy(os.path.join(TRACKER, name), os.path.join(folder, "data", name))
+            with open(os.path.join(TRACKER, name)) as f:
+                data = json.load(f)
+            data.pop("app_meta", None)
+            with open(os.path.join(folder, "data", name), "w") as f:
+                json.dump(data, f)
         output = tour(folder, "tracking")
     assert "TOUR page review ok" in output
 

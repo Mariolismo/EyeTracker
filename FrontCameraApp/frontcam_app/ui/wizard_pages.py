@@ -6,6 +6,7 @@ only through controller.worker.call, and to the files only through the controlle
 """
 
 import collections
+import logging
 import time
 
 import numpy as np
@@ -31,6 +32,8 @@ NEAR_MARKER_MM, FAR_MARKER_MM = 60.0, 150.0
 DWELL_COOLDOWN_S = 1.0
 PAGE_STYLE = "QLabel{font-size:18px;} QPushButton{font-size:17px;padding:10px 20px;}"
 LEVEL_COLOURS = {review.GREEN: "#1e9e4a", review.AMBER: "#d08a00", review.RED: "#c62828"}
+
+log = logging.getLogger(__name__)
 
 
 def heading(text):
@@ -289,7 +292,7 @@ class EyePage(Page):
         self.state.setWordWrap(True)
         self.state.setTextFormat(Qt.RichText)
         self.confidence = QProgressBar()
-        self.confidence.setFormat("Pupil confidence %p%")
+        self.confidence.setFormat("Pupil quality %p%")
         self.convergence = QProgressBar()
         self.convergence.setFormat("Eye model %p%")
         side = QVBoxLayout()
@@ -300,7 +303,7 @@ class EyePage(Page):
         side.addWidget(self.state)
         side.addStretch(1)
         for text, slot in (("Lock eye model (L)", self.lock), ("Look into the lens (O)", self.override),
-                           ("Unlock / adapt again (U)", self.unlock), ("Wink test (T)", self.start_wink)):
+                           ("Unlock / start the model again (U)", self.unlock), ("Wink test (T)", self.start_wink)):
             side.addWidget(button(text, slot))
         row = QHBoxLayout()
         row.addWidget(button("Back", controller.wizard_back))
@@ -358,7 +361,7 @@ class EyePage(Page):
 
     def _show(self):
         result = self.result
-        confidence = 0.0 if result is None or result.status != "ok" else result.confidence
+        confidence = 0.0 if result is None or result.status != "ok" else result.quality
         self.confidence.setValue(int(confidence * 100))
         stability = self.stability_px()
         progress = min(1.0, self.center_count / MIN_MODEL_CENTERS)
@@ -406,9 +409,8 @@ class EyePage(Page):
         eye = self.eye
 
         def unlock(pipeline):
-            tracker = pipeline.trackers[eye]
-            tracker.unlock_sphere()
-            tracker.set_adjustment_enabled(True)
+            # A fresh model: the radius only ever grows, so one built on lash fits never recovers
+            pipeline.trackers[eye].reset()
 
         self.controller.worker.call(unlock)
         self.controller.invalidate_gaze(f"the {eye} eye model was unlocked")
@@ -433,7 +435,7 @@ class EyePage(Page):
 
         def tracked(eye):
             result = bundle.eyes.get(eye)
-            return result is not None and result.status == "ok" and result.confidence >= 0.7
+            return result is not None and result.status == "ok" and result.quality >= 0.7
 
         dt = 0.0 if self.wink["last"] is None else min(0.2, now - self.wink["last"])
         self.wink["last"] = now
@@ -553,9 +555,14 @@ class TargetPage(Page):
         canvas = self.canvas
         result = capture_gates.evaluate(bundle.history, self.context(), self.controller.camera)
         self.last_result = result
+        reason = result.failures[0] if result.failures else "ok"
+        if reason != getattr(self, "_last_gate_reason", None):
+            self._last_gate_reason = reason
+            log.info("Gate %s: %s %s", self.band, reason, result.stats)
         now = time.perf_counter()
         dwell = self.controller.settings["capture_mode"] == "dwell"
-        if result.ok and now >= self.cooldown_until:
+        band_done = self._band_done_text()
+        if result.ok and now >= self.cooldown_until and band_done is None:
             self.ok_since = self.ok_since or now
         else:
             self.ok_since = None
@@ -566,6 +573,8 @@ class TargetPage(Page):
                 self.capture()
         if now < self.flash_until:
             canvas.status, canvas.status_ok = self.flash, True
+        elif band_done is not None:
+            canvas.status, canvas.status_ok = band_done, True
         elif result.ok:
             canvas.status = "Ready: hold your gaze" if dwell else "Ready: press Space (or the clicker)"
             canvas.status_ok = True
@@ -575,14 +584,30 @@ class TargetPage(Page):
         canvas.depth = None if marker is None else float(marker.point[2])
         canvas.band = self.band
         canvas.current_cell = None if marker is None else capture_gates.cell_of(marker.pixel, FRONT_SIZE)
-        canvas.confidence = {eye: (0.0 if r is None or r.status != "ok" else r.confidence)
+        canvas.confidence = {eye: (0.0 if r is None or r.status != "ok" else r.quality)
                              for eye, r in bundle.eyes.items()}
         canvas.set_front(bundle.front)
+        canvas.set_eyes({eye: None if r is None else r.frame for eye, r in bundle.eyes.items()})
         canvas.front_marks = [] if marker is None else [(marker.corners, QColor(0, 160, 255))]
         if bundle.estimate is not None and self.mode == self.VERIFY:
             canvas.front_marks.append((np.asarray(bundle.estimate.pixel).reshape(1, 2), QColor(255, 40, 40)))
         self._texts()
         canvas.update()
+
+    def _band_done_text(self):
+        """The next step once this band has its target samples (dwell stops; Space still adds more), else None."""
+        session = self.controller.session
+        if self.mode == self.VERIFY or session is None:
+            return None
+        count = len(session.pixels(self.band))
+        if count < capture_gates.TARGET_PER_BAND:
+            return None
+        label = self.band.upper()
+        if self.mode == self.CALIBRATE and self.band == "near" and not session.band_ready("far"):
+            return f"{label} done ({count}): press N for the FAR samples"
+        if session.ready:
+            return f"{label} done ({count}): press S to solve"
+        return f"{label} done ({count}): press B and finish NEAR"
 
     def _texts(self):
         canvas = self.canvas
@@ -603,7 +628,8 @@ class TargetPage(Page):
             canvas.title = f"Quick recalibration: stand under {gg.NEAR_BAND_MAX_M} m and look at the marker's center"
             canvas.counts = f"Near {counts['near']}/{target}"
         elif self.band == "near":
-            canvas.title = f"Gaze NEAR: stand under {gg.NEAR_BAND_MAX_M} m and look at the marker's center"
+            canvas.title = (f"Gaze NEAR: stand under {gg.NEAR_BAND_MAX_M} m; turn your head to put the "
+                            "marker in each square")
             canvas.counts = f"Near {counts['near']}/{target}\nFar {counts['far']}/{target}"
         else:
             canvas.title = (f"Gaze FAR: stand over {gg.FAR_BAND_MIN_M} m; turn your head to put the "
@@ -640,9 +666,7 @@ class TargetPage(Page):
             sounds.play("done")
             text = warning or ("Near done: press N for the far samples" if self.mode == self.CALIBRATE and
                                self.band == "near" else "Done: press S to solve")
-        self._flash(text, 3.0 if warning else 1.5)
-        if self.band == "near":
-            self.move_marker()
+        self._flash(text, 3.0 if warning else 1.5)  # The marker stays: head turns cover the grid (Tab moves it)
 
     def _measure(self, sample):
         estimate, baseline = self.controller.estimate_for(sample.gaze)

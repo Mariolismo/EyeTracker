@@ -87,6 +87,9 @@ class Controller(QObject):
         self.manager = cr.CameraManager()
         gaze_vector = self.settings["gaze_vector_path"] or None
         self.pipeline = Pipeline(self.camera, dict(self.setup.roles), gaze_vector_path=gaze_vector)
+        for tracker in self.pipeline.trackers.values():
+            tracker.search_in_eye_circle = bool(self.settings["pupil_search_in_eye_circle"])
+            tracker.pupil_seeds = max(1, int(self.settings["pupil_seeds"]))
         self.worker = Worker(self.pipeline, self.manager)
         self.worker.bundle_ready.connect(self._on_bundle)
 
@@ -658,6 +661,7 @@ class Controller(QObject):
         tracking = self.pages["tracking"]
         actions = {Qt.Key_R: self.start_quick, Qt.Key_V: self.start_verify, Qt.Key_W: self.start_wizard,
                    Qt.Key_C: self.open_cameras, Qt.Key_O: self.start_overlay, Qt.Key_H: self.toggle_heatmap,
+                   Qt.Key_X: tracking.toggle_recording,
                    Qt.Key_F1: tracking.toggle_help, Qt.Key_Q: self.window.close}
         if key in actions:
             actions[key]()
@@ -674,6 +678,7 @@ class Controller(QObject):
         if getattr(self, "_shut_down", False):
             return
         self._shut_down = True
+        self.pages["tracking"].stop_recording()
         self.timer.stop()
         if self.overlay is not None:
             self.overlay.stop()

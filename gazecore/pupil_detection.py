@@ -11,6 +11,14 @@ import cv2
 import numpy as np
 
 EYE_FRAME_SIZE = (640, 480)  # Every eye frame is cropped to 4:3 and resized to this
+REGION_MARGIN_PX = 25  # Past the search circle: the circle bounds pupil centers, not pupil edges
+REGION_TRUST_CONFIDENCE = 0.85  # A fit inside the circle this good is kept without a whole-frame check
+SEED_SEPARATION_PX = 80  # get_darkest_areas: seeds closer than this would fit the same blob
+SEED_BLUR_PX = 31  # get_darkest_areas: about a pupil's width
+SEED_BLOB_PX = 10  # A seeded fit keeps only contours within this of its seed
+FIT_CROP_MARGIN_PX = 60  # _fit_cropped: room past the threshold square for the ellipse masks
+EDGE_OFFSET_PX = 6  # edge_support: sampled this far inside and outside the rim
+EDGE_STEP = 8  # edge_support: grey levels brighter outside than inside to count as pupil edge
 
 
 # Crop the image to maintain a specific aspect ratio (width:height) before resizing.
@@ -41,7 +49,8 @@ def apply_binary_threshold(image, darkestPixelValue, addedThreshold):
     return thresholded_image
 
 # Finds a square area of dark pixels in the image
-def get_darkest_area(image):
+def get_darkest_area(image, region=None):
+    """region: optional (cx, cy, radius); only blocks centered inside that circle are searched."""
     ignoreBounds = 20
     imageSkipSize = 10
     searchArea = 20
@@ -53,6 +62,9 @@ def get_darkest_area(image):
 
     for y in range(ignoreBounds, gray.shape[0] - ignoreBounds, imageSkipSize):
         for x in range(ignoreBounds, gray.shape[1] - ignoreBounds, imageSkipSize):
+            if region is not None and ((x + searchArea // 2 - region[0]) ** 2
+                                       + (y + searchArea // 2 - region[1]) ** 2 > region[2] ** 2):
+                continue
             current_sum = 0
             num_pixels = 0
             for dy in range(0, searchArea, internalSkipSize):
@@ -69,6 +81,106 @@ def get_darkest_area(image):
                 darkest_point = (x + searchArea // 2, y + searchArea // 2)
 
     return darkest_point
+
+def _darkest_area_fast(image, region=None):
+    """get_darkest_area vectorised: the same sampled sums, and argmin keeps its first-wins order."""
+    ignoreBounds, imageSkipSize, searchArea, internalSkipSize = 20, 10, 20, 5
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.int64)
+    ys = np.arange(ignoreBounds, gray.shape[0] - ignoreBounds, imageSkipSize)
+    xs = np.arange(ignoreBounds, gray.shape[1] - ignoreBounds, imageSkipSize)
+    if len(ys) == 0 or len(xs) == 0:
+        return None
+    sums = np.zeros((len(ys), len(xs)), np.int64)
+    for dy in range(0, searchArea, internalSkipSize):
+        for dx in range(0, searchArea, internalSkipSize):
+            sums += gray[np.ix_(np.minimum(ys + dy, gray.shape[0] - 1), np.minimum(xs + dx, gray.shape[1] - 1))]
+    centers_y, centers_x = np.meshgrid(ys + searchArea // 2, xs + searchArea // 2, indexing="ij")
+    if region is not None:
+        outside = (centers_x - region[0]) ** 2 + (centers_y - region[1]) ** 2 > region[2] ** 2
+        if outside.all():
+            return None
+        sums[outside] = np.iinfo(np.int64).max
+    index = int(np.argmin(sums))
+    return int(centers_x.flat[index]), int(centers_y.flat[index])
+
+
+def get_darkest_areas(image, count, region=None):
+    """Up to `count` seeds, SEED_SEPARATION_PX apart: get_darkest_area's first, then the darkest
+    spots after a SEED_BLUR_PX box blur. A solid pupil stays dark under the blur; lashes, with
+    skin between them, do not, so the pupil gets a seed even when a lash clump is darker."""
+    first = _darkest_area_fast(image, region)
+    if first is None:
+        return []
+    gray = cv2.blur(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (SEED_BLUR_PX, SEED_BLUR_PX))
+    margin, step = SEED_BLUR_PX, 5
+    sub = gray[margin:-margin:step, margin:-margin:step].astype(np.int32)
+    centers_y, centers_x = np.mgrid[margin:gray.shape[0] - margin:step, margin:gray.shape[1] - margin:step]
+    if region is not None:
+        sub[(centers_x - region[0]) ** 2 + (centers_y - region[1]) ** 2 > region[2] ** 2] = 256
+    points = [first]
+    for index in np.argsort(sub, axis=None, kind="stable"):
+        if len(points) == count or sub.flat[index] > 255:
+            break
+        point = (int(centers_x.flat[index]), int(centers_y.flat[index]))
+        if all((point[0] - p[0]) ** 2 + (point[1] - p[1]) ** 2 >= SEED_SEPARATION_PX ** 2 for p in points):
+            points.append(point)
+    return points
+
+
+def pupil_contrast(gray, ellipse):
+    """(ring - inside) / ring of the median grey levels: about 0.5+ for a pupil against its
+    iris, lower for a lash clump with skin showing through it."""
+    outer_ellipse = (ellipse[0], (ellipse[1][0] * 1.8, ellipse[1][1] * 1.8), ellipse[2])
+    x, y, width, height = cv2.boundingRect(cv2.boxPoints(outer_ellipse).astype(np.int32))
+    x0, y0 = max(x, 0), max(y, 0)
+    gray = gray[y0:max(y + height, y0), x0:max(x + width, x0)]  # Only the ring's box: cheap
+    shifted = lambda e: ((e[0][0] - x0, e[0][1] - y0), e[1], e[2])
+    inside = np.zeros_like(gray)
+    cv2.ellipse(inside, shifted(ellipse), 255, -1)
+    ring = np.zeros_like(gray)
+    cv2.ellipse(ring, shifted(outer_ellipse), 255, -1)
+    ring[inside > 0] = 0
+    if not inside.any() or not ring.any():
+        return 0.0
+    inner, outer = np.median(gray[inside > 0]), np.median(gray[ring > 0])
+    return max(0.0, float(outer - inner) / max(float(outer), 1.0))
+
+
+def edge_support(gray, ellipse, samples=72):
+    """Share of the ellipse rim where the image steps from dark inside to bright outside
+    (EDGE_STEP grey levels, EDGE_OFFSET_PX either side). Glints inside the pupil and lashes
+    touching it, which notch the thresholded blob, don't move it."""
+    (cx, cy), (width, height), angle = ellipse
+    t = np.linspace(0, 2 * np.pi, samples, endpoint=False)
+    a = np.radians(angle)
+    ex, ey = width / 2 * np.cos(t), height / 2 * np.sin(t)
+    x, y = cx + ex * np.cos(a) - ey * np.sin(a), cy + ex * np.sin(a) + ey * np.cos(a)
+    nx, ny = x - cx, y - cy
+    norm = np.hypot(nx, ny) + 1e-9
+    nx, ny = nx / norm, ny / norm
+    smooth = cv2.GaussianBlur(gray, (5, 5), 0).astype(np.float32)
+
+    def at(px, py):
+        return smooth[np.clip(py, 0, gray.shape[0] - 1).astype(int), np.clip(px, 0, gray.shape[1] - 1).astype(int)]
+
+    step = at(x + EDGE_OFFSET_PX * nx, y + EDGE_OFFSET_PX * ny) - at(x - EDGE_OFFSET_PX * nx, y - EDGE_OFFSET_PX * ny)
+    return float(np.mean(step > EDGE_STEP))
+
+
+def pupil_quality(observation):
+    """(confidence + edge_support) / 2, 0 without an ellipse: steadier than the confidence alone
+    on a well-tracked pupil, and still low on lash fits (at most 0.64 on recorded frames, where
+    pupils mostly score 0.75+). The confidence itself stays as it is: the eye model uses it."""
+    if observation.ellipse is None:
+        return 0.0
+    gray = cv2.cvtColor(observation.frame, cv2.COLOR_BGR2GRAY)
+    return (float(observation.confidence) + edge_support(gray, observation.ellipse)) / 2
+
+
+def touches_frame_edge(ellipse, shape, pad=20):
+    """A pupil cut by the frame edge can't be fitted honestly; it's usually a shadow there."""
+    x, y, width, height = cv2.boundingRect(cv2.boxPoints(ellipse).astype(np.int32))
+    return x <= pad or y <= pad or x + width >= shape[1] - pad or y + height >= shape[0] - pad
 
 # Mask all pixels outside a square defined by center and size
 def mask_outside_square(image, center, size):
@@ -239,16 +351,88 @@ class PupilObservation:
     confidence: float = 0.0  # Share of the contour under the ellipse (the "%" on the eye view)
 
 
-def detect_pupil(frame):
-    """Find the pupil ellipse in one BGR eye frame of any size."""
+def detect_pupil(frame, search_region=None, seeds=1):
+    """Find the pupil ellipse in one BGR eye frame of any size.
+
+    search_region: optional (cx, cy, radius) in the cropped frame's pixels. The darkest-area
+    search, which seeds the thresholds, stays inside it (falling back to the whole frame when
+    nothing is inside), and the thresholded images are clipped to it plus REGION_MARGIN_PX, so
+    eyelashes and eye-corner shadows can't win either step. The circle is only as good as the
+    eye model, so a fit inside it under REGION_TRUST_CONFIDENCE is checked against the whole
+    frame and the better-fitting ellipse kept.
+    seeds: how many separate dark areas to fit from (get_darkest_areas). A lash clump darker
+    than the pupil wins the single darkest area, and the original then fits the largest blob
+    near it, wherever it starts. With seeds > 1 each fit uses only the blob around its own
+    seed, fits touching the frame edge are dropped, and the best confidence x pupil_contrast
+    is kept. None and 1: the original.
+    With seeds > 1 and a search_region there is no whole-frame check: one pass inside the
+    circle, and fits centered outside it are dropped (no pupil rather than a lash fit). A wrong
+    circle is fixed by resetting the eye model, not by searching past it.
+    """
     # Crop and resize frame
     frame = crop_to_aspect_ratio(frame)
+    if search_region is None or seeds > 1:
+        return _detect_in(frame, search_region, seeds)
+    inside = _detect_in(frame, search_region, seeds)
+    if inside.confidence >= REGION_TRUST_CONFIDENCE:
+        return inside
+    anywhere = _detect_in(frame, None, seeds)
+    return anywhere if anywhere.confidence > inside.confidence else inside
+
+
+def _detect_in(frame, search_region, seeds):
+    if seeds > 1:
+        points = get_darkest_areas(frame, seeds, search_region)
+        if not points:
+            return PupilObservation(frame)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        fits = [_fit_cropped(frame, point, search_region, refine=False) for point in points]
+        fits = [fit for fit in fits if fit.ellipse is not None and not touches_frame_edge(fit.ellipse, gray.shape)
+                and _inside_circle(fit.ellipse, search_region)]
+        if not fits:
+            return PupilObservation(frame, points[0])
+        best = max(fits, key=lambda fit: fit.confidence * pupil_contrast(gray, fit.ellipse))
+        final = _fit_cropped(frame, best.darkest_point, search_region, refine=True)
+        if final.ellipse is not None and not _inside_circle(final.ellipse, search_region):
+            return PupilObservation(frame, best.darkest_point)
+        return final
 
     #find the darkest point
-    darkest_point = get_darkest_area(frame)
+    darkest_point = None if search_region is None else get_darkest_area(frame, search_region)
+    if darkest_point is None:
+        search_region = None  # Fell back: the whole frame, unclipped
+        darkest_point = get_darkest_area(frame)
     if darkest_point is None:
         return PupilObservation(frame)
+    return _fit_at(frame, darkest_point, search_region)
 
+
+def _inside_circle(ellipse, search_region):
+    """A pupil is centered inside the eyeball's circle and smaller than it."""
+    if search_region is None:
+        return True
+    return (np.hypot(ellipse[0][0] - search_region[0], ellipse[0][1] - search_region[1]) <= search_region[2]
+            and max(ellipse[1]) / 2 <= search_region[2])
+
+
+def _fit_cropped(frame, seed, search_region, refine):
+    """_fit_at on its own blob, run on the box its 250 px threshold square leaves unmasked (plus
+    a margin for the ellipse masks): the full-frame mask sums made each seed cost a whole fit."""
+    half = 125 + FIT_CROP_MARGIN_PX
+    x0, y0 = max(seed[0] - half, 0), max(seed[1] - half, 0)
+    crop = frame[y0:seed[1] + half, x0:seed[0] + half]
+    region = None if search_region is None else (search_region[0] - x0, search_region[1] - y0, search_region[2])
+    fit = _fit_at(crop, (seed[0] - x0, seed[1] - y0), region, own_blob=True, refine=refine)
+    ellipse, center = fit.ellipse, fit.center
+    if ellipse is not None:
+        ellipse = ((ellipse[0][0] + x0, ellipse[0][1] + y0), ellipse[1], ellipse[2])
+    if center[0] is not None:
+        center = (center[0] + x0, center[1] + y0)
+    return PupilObservation(frame, seed, ellipse, center, fit.confidence)
+
+
+def _fit_at(frame, darkest_point, search_region, own_blob=False, refine=True):
+    """refine=False skips optimize_contours_by_angle (slow): enough to rank seeds."""
     # Convert to grayscale to handle pixel value operations
     gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     darkest_pixel_value = int(gray_frame[darkest_point[1], darkest_point[0]])
@@ -265,6 +449,13 @@ def detect_pupil(frame):
     thresholded_image_relaxed = mask_outside_square(thresholded_image_relaxed, darkest_point, 250)
 
     image_array = [thresholded_image_relaxed, thresholded_image_medium, thresholded_image_strict] #holds images
+    if search_region is not None:
+        # Clip the thresholds to the circle too: seeding inside it alone still lets lashes just
+        # outside it join the binary images and win the largest-contour pick
+        circle = np.zeros_like(gray_frame)
+        cv2.circle(circle, (int(search_region[0]), int(search_region[1])),
+                   int(search_region[2]) + REGION_MARGIN_PX, 255, -1)
+        image_array = [cv2.bitwise_and(image, circle) for image in image_array]
     final_contours = [] #holds final contours
     goodness = 0 #goodness value for best ellipse
     kernel_size = 5  # Size of the kernel (5x5)
@@ -282,6 +473,9 @@ def detect_pupil(frame):
             cv2.RETR_EXTERNAL,
             cv2.CHAIN_APPROX_SIMPLE
         )
+        if own_blob:
+            contours = [c for c in contours
+                        if cv2.pointPolygonTest(c, (float(darkest_point[0]), float(darkest_point[1])), True) >= -SEED_BLOB_PX]
 
         reduced_contours = filter_contours_by_area_and_return_largest(contours, 1000, 3)
 
@@ -324,8 +518,9 @@ def detect_pupil(frame):
     center_x = best_center_x
     center_y = best_center_y
 
-    final_contours = [optimize_contours_by_angle(final_contours, gray_frame)]
-    
+    if refine:
+        final_contours = [optimize_contours_by_angle(final_contours, gray_frame)]
+
     final_rotated_rect = None
 
     if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0]) >= 5:

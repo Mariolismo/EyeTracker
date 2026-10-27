@@ -15,6 +15,10 @@ DEFAULTS = {
     "capture_mode": "manual",  # "manual" (Space/C/clicker) or "dwell" (hold the gaze ~1 s)
     "dwell_seconds": 1.0,
     "frames_averaged": 30,  # Frames averaged per calibration sample; 1 = the tracker's single frame
+    # Locked eyes: only pupils centered inside the eye circle (with pupil_seeds > 1: one pass, no
+    # whole-frame retry, so it costs nothing; a fit outside the circle is dropped, U resets the model)
+    "pupil_search_in_eye_circle": True,
+    "pupil_seeds": 4,  # Dark areas tried per frame; 1 is the original single darkest-area search
     "target_screen": None,  # QScreen name the targets and the overlay use (None: primary)
     "overlay_heatmap": True,
     "overlay_midpoints": False,  # Edge-midpoint markers too, for a monitor wider than the front camera's view

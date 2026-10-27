@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .pupil_detection import PupilObservation, detect_pupil
+from .pupil_detection import PupilObservation, detect_pupil, pupil_quality
 
 log = logging.getLogger(__name__)
 
@@ -285,6 +285,7 @@ class EyeResult:
     adjusting: bool  # The eyeball center and radius still adapt
     override_samples: int  # Pupil centers collected by a running O override, else None
     events: list = field(default_factory=list)
+    quality: float = 0.0  # pupil_quality: what the app judges a fit by; the model still uses confidence
 
     @property
     def frame(self):
@@ -310,6 +311,12 @@ class EyeTracker:
         self.eye_id = eye_id
         # Both eyes share the global generator by default, like the original tracker.
         self.rng = rng
+        # Off: the original tracker. On: once the eyeball center is fixed, the darkest-area search
+        # stays inside the eye circle (config, not tracking state, so not in STATE_NAMES).
+        self.search_in_eye_circle = False
+        # 1: the original single darkest-area seed. More: detect_pupil's multi-seed search, which
+        # keeps a lash clump darker than the pupil from taking the fit (and the eye model).
+        self.pupil_seeds = 1
         self.reset()
 
     def reset(self):
@@ -398,7 +405,14 @@ class EyeTracker:
 
     def process(self, frame):
         """Track one BGR frame of this eye's camera (any size)."""
-        return self.update(detect_pupil(frame))
+        return self.update(detect_pupil(frame, self.search_region(), self.pupil_seeds))
+
+    def search_region(self):
+        """(cx, cy, radius) of the eye circle when search_in_eye_circle applies, else None."""
+        if not (self.search_in_eye_circle and self.fixed and self.max_observed_distance > 0):
+            return None
+        center = self.locked_model_center_avg if self.sphere_center_locked_2d else self.prev_model_center_avg
+        return center[0], center[1], float(self.max_observed_distance)
 
     def update(self, observation):
         if observation.darkest_point is None:
@@ -483,6 +497,7 @@ class EyeTracker:
             observation, status, model_center, float(self.max_observed_distance), self.last_gaze_dir,
             gaze_output, self.last_gaze_vector_text, bool(self.sphere_center_locked_2d), bool(self.adjusting),
             len(self.center_override_samples) if self.center_override_collecting else None, events,
+            pupil_quality(observation),  # Now: the eye overlay later draws on the frame
         )
 
     def _collect_center_override_sample(self, center_x, center_y, events):
