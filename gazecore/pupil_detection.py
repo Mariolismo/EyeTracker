@@ -216,12 +216,15 @@ def edge_support(gray, ellipse, samples=72):
     nx, ny = x - cx, y - cy
     norm = np.hypot(nx, ny) + 1e-9
     nx, ny = nx / norm, ny / norm
-    smooth = cv2.GaussianBlur(gray, (5, 5), 0).astype(np.float32)
-
-    def at(px, py):
-        return smooth[np.clip(py, 0, gray.shape[0] - 1).astype(int), np.clip(px, 0, gray.shape[1] - 1).astype(int)]
-
-    step = at(x + EDGE_OFFSET_PX * nx, y + EDGE_OFFSET_PX * ny) - at(x - EDGE_OFFSET_PX * nx, y - EDGE_OFFSET_PX * ny)
+    pixel = lambda px, py: (np.clip(px, 0, gray.shape[1] - 1).astype(int), np.clip(py, 0, gray.shape[0] - 1).astype(int))
+    outside = pixel(x + EDGE_OFFSET_PX * nx, y + EDGE_OFFSET_PX * ny)
+    inside = pixel(x - EDGE_OFFSET_PX * nx, y - EDGE_OFFSET_PX * ny)
+    # Blur only the samples' box (ranking seeds calls this per fit): 2 px past it, the 5x5 kernel's
+    # reach, every sample sees the pixels a whole-frame blur would
+    xs, ys = np.concatenate([outside[0], inside[0]]), np.concatenate([outside[1], inside[1]])
+    x0, y0 = max(int(xs.min()) - 2, 0), max(int(ys.min()) - 2, 0)
+    smooth = cv2.GaussianBlur(gray[y0:int(ys.max()) + 3, x0:int(xs.max()) + 3], (5, 5), 0).astype(np.float32)
+    step = smooth[outside[1] - y0, outside[0] - x0] - smooth[inside[1] - y0, inside[0] - x0]
     return float(np.mean(step > EDGE_STEP))
 
 
@@ -423,8 +426,10 @@ def detect_pupil(frame, search_region=None, seeds=1):
     near it, wherever it starts. With seeds > 1 each fit uses only the blob around its own
     seed and is made twice, with the original thresholds and with adaptive_thresholds (a pupil
     lit unevenly or split by a reflection); fits touching the frame edge are dropped, and the
-    best confidence x pupil_contrast is kept, the adaptive fit taking over its seed's fixed one
-    when it is the same pupil with more of it (extension_is_pupil). None and 1: the original.
+    best confidence x pupil_contrast x edge_support is kept (a lash clump can match a pupil on
+    the first two, but its rim is not a dark-to-bright edge), the adaptive fit taking over its
+    seed's fixed one when it is the same pupil with more of it (extension_is_pupil). None and
+    1: the original.
     With seeds > 1 and a search_region there is no whole-frame check: one pass inside the
     circle, and fits centered outside it are dropped (no pupil rather than a lash fit). A wrong
     circle is fixed by resetting the eye model, not by searching past it.
@@ -453,7 +458,8 @@ def _detect_in(frame, search_region, seeds):
                 and not touches_frame_edge(fit.ellipse, gray.shape) and _inside_circle(fit.ellipse, search_region)]
         if not fits:
             return PupilObservation(frame, points[0])
-        score = {id(fit): fit.confidence * pupil_contrast(gray, fit.ellipse) for fit, _ in fits}
+        score = {id(fit): fit.confidence * pupil_contrast(gray, fit.ellipse) * edge_support(gray, fit.ellipse)
+                 for fit, _ in fits}
         for crescent, adaptive in fits:
             for whole, whole_adaptive in fits:
                 if (not adaptive and whole_adaptive and whole.darkest_point == crescent.darkest_point

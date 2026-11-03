@@ -1,11 +1,14 @@
 """The eye-circle search: a darker blob outside the circle (eyelashes, a corner shadow) must not
 seed the thresholds once the eyeball center is fixed; off by default, as in the original tracker."""
 
+import os
+
 import cv2
 import numpy as np
 
 from gazecore import pupil_detection as pd
 from gazecore.eye_tracker import EyeTracker
+from gazecore.paths import REPO_ROOT
 
 
 def eye_image():
@@ -91,6 +94,16 @@ def test_seeds_fit_the_whole_of_a_lit_pupil():
     observation = pd.detect_pupil(image, seeds=4)
     assert np.hypot(*np.subtract(observation.ellipse[0], (320, 240))) < 2
     assert min(observation.ellipse[1]) > 52  # The whole pupil (the fit runs on the dilated blob)
+
+
+def test_seeds_rank_a_lash_fit_below_the_pupil_by_its_rim():
+    capture = cv2.VideoCapture(os.path.join(REPO_ROOT, "eye_test.mp4"))
+    capture.set(cv2.CAP_PROP_POS_FRAMES, 795)  # A lash clump above the pupil matched it on confidence x contrast
+    ok, frame = capture.read()
+    capture.release()
+    assert ok
+    ellipse = pd.detect_pupil(frame, seeds=4).ellipse
+    assert np.hypot(*np.subtract(ellipse[0], (344, 296))) < 5  # The pupil, not the lashes at (447, 277)
 
 
 def test_a_reflection_on_the_pupil_does_not_lower_its_contrast():
