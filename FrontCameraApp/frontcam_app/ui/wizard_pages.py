@@ -305,6 +305,11 @@ class EyePage(Page):
         for text, slot in (("Lock eye model (L)", self.lock), ("Look into the lens (O)", self.override),
                            ("Unlock / start the model again (U)", self.unlock), ("Wink test (T)", self.start_wink)):
             side.addWidget(button(text, slot))
+        # Both eyes, from any page but Cameras (tracking pauses there); the text follows E pressed anywhere
+        self.capture_button = button("Record eye frames (E)", controller.toggle_eye_capture)
+        self.capture_button.setToolTip("Save both eyes' raw frames and pupil fits to FrontCameraApp/sessions, "
+                                       "to replay the pupil detector on them. E again stops.")
+        side.addWidget(self.capture_button)
         row = QHBoxLayout()
         row.addWidget(button("Back", controller.wizard_back))
         row.addWidget(button("Next (Enter)", self.next))
@@ -350,6 +355,9 @@ class EyePage(Page):
     def on_tick(self):
         eye = self.eye
         self.controller.worker.call(lambda p: len(p.trackers[eye].model_centers), self._got_count)
+        capture = self.controller.eye_capture
+        self.capture_button.setText("Record eye frames (E)" if capture is None
+                                    else f"Stop eye recording: {capture.saved} frames (E)")
 
     def _got_count(self, count):
         self.center_count = count or 0

@@ -92,6 +92,7 @@ class Pipeline:
         self.intrinsics_calibrator = None
         self.charuco_cells = {}
         self.screen_tracker = None  # Set while the desktop overlay runs (screen_geometry)
+        self.eye_capture = None  # EyeCapture while raw eye frames are being saved (E)
         self.gaze_vector_path = gaze_vector_path
         self.history = collections.deque(maxlen=HISTORY_LENGTH)
         self.seq = 0
@@ -159,7 +160,11 @@ class Pipeline:
                 continue
             seen_seq, result = self._last_eye.get(eye_id, (None, None))
             if packet.seq != seen_seq:  # A frame is tracked once: tracking changes the eye model
+                capture = self.eye_capture
+                region = None if capture is None else tracker.search_region()
                 result = tracker.process(orient(packet.frame, self.bindings.get(eye_id)))
+                if capture is not None:  # Before the overlay draws on the frame
+                    capture.add(eye_id, packet.seq, packet.t, result, region, tracker.fixed)
                 if result.gaze_output is not None:
                     self.gaze_outputs[eye_id] = result.gaze_output
                 events += result.events

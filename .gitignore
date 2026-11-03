@@ -11,3 +11,10 @@ FrontCameraTracker/calibrations/
 FrontCameraApp/settings/
 FrontCameraApp/sessions/
 FrontCameraApp/logs/
+
+# Virtual environments (app: .venv, PupilNet training: .venv-train)
+.venv*/
+
+# PupilNet: datasets and training runs stay local (models are committed under gazecore/models/)
+PupilNet/data/
+PupilNet/runs/

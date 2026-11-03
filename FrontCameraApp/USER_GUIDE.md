@@ -35,6 +35,7 @@ the processed frame rate, and the calibration's accuracy, eye separation and age
 | **O** | Desktop overlay (gaze ring and heatmap on the monitor) |
 | **H** | Heatmap on/off |
 | **X** | Record the tracking view to `sessions/tracking_<time>.mp4`, with a CSV of gaze pixel, depth, pupil confidence and pupil quality per frame (X again stops) |
+| **E** | Capture raw eye frames for testing or training the pupil detector, on any page but Cameras (E again stops). See *Eye data capture* below |
 | **F1** | Help |
 | **Q** | Quit |
 
@@ -114,6 +115,35 @@ see at least two of the corner markers.
 
 The overlay can't draw over exclusive full-screen games or Windows security prompts.
 
+## Eye data capture (E)
+
+Records what the pupil detector sees, to replay a detector change on real frames or to train
+PupilNet (`PupilNet/README.md`). **E** starts and stops it on any page, calibrated or not, except
+Cameras (eye tracking pauses there), and the Left/Right eye pages of the wizard have a *Record
+eye frames* button; it records both eyes. Frames captured
+before the eye models are locked have no eye circle, so they test the whole-frame search; to
+test tracking as it runs, capture from the Tracking view. Each capture goes to
+`sessions/eye_capture_<time>_<subject>/` (the subject is `unknown` unless set):
+- every 2nd frame of each eye as a grey PNG (`capture_every` in `app_settings.json`), taken
+  before anything is drawn on it;
+- `frames.csv`: the current detector's ellipse, confidence and quality for every frame;
+- `meta.json`: the subject, cameras and settings.
+
+For PupilNet training, set `capture_subject` in `app_settings.json` to an anonymous subject ID (`P01`, `P02`, …) and the same one for every session of the
+same person: the training keeps whole people out of training so they can be used for testing.
+
+**Protocol, about 3 minutes per session.** Calibrate the eye models first (Tracking view, eye
+bars full), press **E**, then:
+1. Look around slowly in every direction, out to the extremes, for 30 s.
+2. Fixate 9 points (corners, edge midpoints, center) for 2 s each.
+3. Blink normally 10 times, then squint and half-close the eyes a few times.
+4. Look down at the floor (the upper lid covers the pupil) and up at the ceiling.
+5. If the person wears glasses: repeat 1–2 with glasses on.
+6. Take the headset off, put it back on, and repeat 1.
+
+Press **E** to stop. Aim for 6 or more people, 2 sessions each (another day or other room
+lighting if possible).
+
 ## Files
 
 | File | |
@@ -125,6 +155,7 @@ The overlay can't draw over exclusive full-screen games or Windows security prom
 | `FrontCameraApp/settings/app_settings.json` | Capture mode, dwell time, frames averaged, overlay options, `gaze_vector_path` |
 | `FrontCameraApp/settings/monitors.json` | Screen scale per monitor |
 | `FrontCameraApp/logs/` | Log file, one per day |
+| `FrontCameraApp/sessions/` | Recordings (X) and eye data captures (E) |
 | `gaze_vector.txt` (working directory) | Live gaze for Unity, same format as the old tracker |
 
 The app's extra information (which cameras, frame sizes, settings) is stored under an

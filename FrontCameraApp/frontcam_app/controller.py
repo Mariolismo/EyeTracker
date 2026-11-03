@@ -13,6 +13,7 @@ Invalidation is explicit, replacing the tracker's hidden resets:
 import copy
 import logging
 import os
+import re
 import time
 from datetime import datetime
 
@@ -31,6 +32,7 @@ from gazecore.screen_geometry import ScreenLayout, ScreenTracker
 from . import review, sounds
 from . import validity as v
 from .calibration_session import CalibrationSession
+from .eye_capture import EyeCapture
 from .monitors import Monitors, monitor_key, os_mm_per_px
 from .pipeline import FRONT_SIZE, Pipeline
 from .settings import CAMERA_SETUP_FILE, SESSIONS_DIR, AppSettings
@@ -81,6 +83,7 @@ class Controller(QObject):
         self.mode = "connecting"
         self.wizard_steps, self.wizard_index = [], 0
         self.overlay, self.tray = None, None
+        self.eye_capture = None  # EyeCapture while E saves raw eye frames
         self.last_status = {}
         self.other_tracker_warning = self._other_tracker_running()
 
@@ -570,6 +573,36 @@ class Controller(QObject):
             self.overlay.set_heatmap_visible(visible)
         self.banner(f"Heatmap {'on' if visible else 'off'}", "info", 2)
 
+    # --- Eye data capture (PupilNet training frames) ---
+
+    def toggle_eye_capture(self):
+        capture = self.eye_capture
+        if capture is not None:  # Closed once the worker no longer adds to it
+            self.worker.call(lambda p: setattr(p, "eye_capture", None), lambda _: self._close_eye_capture(capture))
+            return
+        # A debug recording first: no prompt. PupilNet's training reads the subject from meta.json;
+        # set capture_subject in app_settings.json when collecting training data.
+        subject = re.sub(r"[^A-Za-z0-9_-]", "", self.settings["capture_subject"]) or "unknown"
+        roles = {role: {"device_id": b.device_id, "name": b.name, "video_file": b.video_file, "flip": b.flip,
+                        "mirror": b.mirror, "native_size": b.native_size}
+                 for role, b in self.setup.roles.items() if b is not None and role in ("left", "right")}
+        settings = {key: self.settings[key] for key in ("pupil_seeds", "pupil_search_in_eye_circle")}
+        directory = os.path.join(SESSIONS_DIR, f"eye_capture_{time.strftime('%Y%m%d_%H%M%S')}_{subject}")
+        capture = EyeCapture(directory, subject, {"cameras": roles, "settings": settings},
+                             every=self.settings["capture_every"])
+        self.eye_capture = capture
+        self.worker.call(lambda p: setattr(p, "eye_capture", capture))
+        log.info("Capturing eye frames to %s", directory)
+        self.banner(f"Recording eye frames (E stops): {directory}", "info", 4)
+
+    def _close_eye_capture(self, capture):
+        if self.eye_capture is not capture:
+            return
+        self.eye_capture = None
+        capture.close()
+        log.info("Saved %d eye frames (%d dropped) to %s", capture.saved, capture.dropped, capture.directory)
+        self.banner(f"Saved {capture.saved} eye frames: {capture.directory}", "info", 5)
+
     def save_heatmap(self):
         if self.overlay is None:
             return
@@ -641,6 +674,9 @@ class Controller(QObject):
                 parts.append("<span style='color:#ffcc33'>legacy file, unverified (V)</span>")
         if self.overlay is not None:
             parts.append(f"overlay paint {self.overlay.paint_ms:.1f} ms")
+        if self.eye_capture is not None:
+            parts.append(f"<span style='color:#ff5555'>&#9679;</span> eye frames: "
+                         f"{self.eye_capture.saved} frames (E stops)")
         parts.append("F1 help")
         return " &nbsp;|&nbsp; ".join(parts)
 
@@ -652,6 +688,9 @@ class Controller(QObject):
 
     def handle_key(self, key, text):
         if self.page is not None and self.page.handle_key(key, text):
+            return True
+        if key == Qt.Key_E:  # Every page: the eyes are tracked on all of them, calibrated or not
+            self.toggle_eye_capture()
             return True
         if self.mode != "tracking":
             if key == Qt.Key_Escape and self.mode == "wizard" and self.solved is not None:
@@ -685,6 +724,8 @@ class Controller(QObject):
         if self.tray is not None:
             self.tray.hide()
         self.worker.stop()
+        if self.eye_capture is not None:  # The worker is stopped: nothing adds to it any more
+            self._close_eye_capture(self.eye_capture)
         self.manager.stop_all()
 
 

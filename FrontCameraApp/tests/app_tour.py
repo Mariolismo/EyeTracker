@@ -36,6 +36,21 @@ def wait(app, seconds):
     loop.exec_()
 
 
+def capture_eyes_from_the_eye_page(app, controller, page):
+    """E works outside the tracking view too, and the eye page's button follows it."""
+    controller_module.SESSIONS_DIR = os.environ["GAZECORE_DATA_DIR"]  # Not the real sessions folder
+    assert controller.handle_key(Qt.Key_E, "e") and controller.eye_capture is not None
+    capture = controller.eye_capture
+    wait(app, 1.5)
+    assert capture.saved > 0 and page.capture_button.text().startswith("Stop"), page.capture_button.text()
+    controller.handle_key(Qt.Key_E, "e")
+    wait(app, 0.5)
+    assert controller.eye_capture is None and os.path.exists(os.path.join(capture.directory, "frames.csv"))
+    page.on_tick()
+    assert page.capture_button.text() == "Record eye frames (E)"
+    print(f"TOUR eye capture on the eye page ok ({capture.saved} frames)", flush=True)
+
+
 def main(left, right, front, expect):
     app = QApplication(sys.argv[:1])
     controller = controller_module.Controller(app, {"left": left, "right": right, "front": front})
@@ -69,6 +84,8 @@ def main(left, right, front, expect):
             code = {" ": Qt.Key_Space, "\t": Qt.Key_Tab}.get(key) or getattr(Qt, f"Key_{key}")
             page.handle_key(code, key)
             wait(app, 0.3)
+        if name == "eye:left":
+            capture_eyes_from_the_eye_page(app, controller, page)
         controller.window.grab()
         print(f"TOUR page {name} ok", flush=True)
     controller._show("tracking")

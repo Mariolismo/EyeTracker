@@ -23,6 +23,8 @@ DEFAULTS = {
     "overlay_heatmap": True,
     "overlay_midpoints": False,  # Edge-midpoint markers too, for a monitor wider than the front camera's view
     "gaze_vector_path": "gaze_vector.txt",  # Relative to the working directory, like the tracker; "" disables
+    "capture_subject": "",  # Eye capture's meta.json subject (PupilNet training); empty saves "unknown"
+    "capture_every": 2,  # E saves every n-th frame of each eye; frames.csv lists all of them
     "last_verify": None,  # {"saved_at": calibration saved_at, "summary": {band: [n, error, baseline]}}
 }
 

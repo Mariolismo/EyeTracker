@@ -1,5 +1,5 @@
 """Tracking: the front camera full-screen with the gaze dot and depth, the eye views as insets
-and a status bar. The keys (R V W O H C X F1 Q) are the controller's, so they work from any page
+and a status bar. The keys (R V W O H C X E F1 Q) are the controller's, so they work from any page
 where they make sense."""
 
 import logging
@@ -24,6 +24,7 @@ HELP = """<h2>Keys</h2>
 <tr><td><b>O</b></td><td>Desktop overlay: gaze ring on the monitor</td></tr>
 <tr><td><b>H</b></td><td>Heatmap on the overlay on/off</td></tr>
 <tr><td><b>X</b></td><td>Record this view to a video (again to stop)</td></tr>
+<tr><td><b>E</b></td><td>Capture raw eye frames for PupilNet training (again to stop)</td></tr>
 <tr><td><b>F1</b></td><td>This help</td></tr>
 <tr><td><b>Q</b></td><td>Quit</td></tr>
 </table>"""
