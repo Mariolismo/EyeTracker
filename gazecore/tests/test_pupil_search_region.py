@@ -75,6 +75,42 @@ def test_quality_marks_the_lash_fit_down_and_the_pupil_fit_up():
     assert pd.pupil_quality(pd.PupilObservation(image)) == 0.0  # No ellipse
 
 
+def bright_room_pupil(lit_grey=45):
+    """A pupil in a lit room: its left half lifted by ambient light, a window reflection across it."""
+    image = np.full((480, 640, 3), 100, np.uint8)  # Iris
+    cv2.ellipse(image, (320, 240), (26, 26), 0, 0, 360, (lit_grey,) * 3, -1)
+    cv2.ellipse(image, (320, 240), (26, 26), 0, -90, 90, (5, 5, 5), -1)  # The right half stays black
+    cv2.rectangle(image, (314, 216), (330, 266), (190, 190, 190), -1)
+    return image
+
+
+def test_seeds_fit_the_whole_of_a_lit_pupil():
+    image = bright_room_pupil()
+    original = pd.detect_pupil(image)  # Darkest pixel + 25 stops short of the lit half...
+    assert original.ellipse[0][0] > 326 and min(original.ellipse[1]) < 46  # ...and fits the black crescent
+    observation = pd.detect_pupil(image, seeds=4)
+    assert np.hypot(*np.subtract(observation.ellipse[0], (320, 240))) < 2
+    assert min(observation.ellipse[1]) > 52  # The whole pupil (the fit runs on the dilated blob)
+
+
+def test_a_reflection_on_the_pupil_does_not_lower_its_contrast():
+    image = np.full((480, 640), 100, np.uint8)  # Iris
+    cv2.ellipse(image, (320, 240), (26, 26), 0, 0, 360, 5, -1)  # Pupil
+    cv2.rectangle(image, (302, 216), (338, 266), 190, -1)  # A reflection over most of it
+    assert pd.pupil_contrast(image, ((320, 240), (52, 52), 0)) > 0.9  # Was 0: the median was the reflection's
+
+
+def test_a_fit_reaching_over_the_lit_pupil_counts_as_the_same_pupil():
+    image = np.full((480, 640), 137, np.uint8)  # Iris
+    cv2.ellipse(image, (320, 240), (34, 34), 0, 0, 360, 27, -1)  # Pupil, lit by the room...
+    cv2.ellipse(image, (320, 252), (34, 22), 0, 0, 360, 1, -1)  # ...but for a black crescent
+    crescent, whole = ((320, 252), (68, 44), 0), ((320, 240), (68, 68), 0)
+    assert pd.extension_is_pupil(image, crescent, whole)
+    image[(image == 27)] = 120  # The same fits on a dark iris: the wider one leaked
+    assert not pd.extension_is_pupil(image, crescent, whole)
+    assert not pd.extension_is_pupil(image, ((420, 240), (40, 40), 0), whole)  # Its center is outside
+
+
 def test_the_first_seed_is_the_original_darkest_area():
     rng = np.random.default_rng(1)
     for image in [eye_image()] + [rng.integers(0, 256, (480, 640, 3), dtype=np.uint8) for _ in range(5)]:

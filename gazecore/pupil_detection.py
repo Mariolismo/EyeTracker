@@ -19,6 +19,12 @@ SEED_BLOB_PX = 10  # A seeded fit keeps only contours within this of its seed
 FIT_CROP_MARGIN_PX = 60  # _fit_cropped: room past the threshold square for the ellipse masks
 EDGE_OFFSET_PX = 6  # edge_support: sampled this far inside and outside the rim
 EDGE_STEP = 8  # edge_support: grey levels brighter outside than inside to count as pupil edge
+THRESHOLD_OFFSETS = (5, 15, 25)  # The original three thresholds, grey levels above the darkest pixel
+THRESHOLD_SHARES = (0.15, 0.3, 0.45)  # adaptive_thresholds: shares of the pupil-to-surround gap
+DARK_PATCH_PX = 41  # adaptive_thresholds: the pupil level is a low percentile of this patch at the seed
+SURROUND_PX = 161  # adaptive_thresholds: the surround level is a percentile of this window
+SURROUND_PERCENTILE = 25  # Below the median: skin and sclera fill the window, but the gap that matters is to the iris
+EXTENSION_DARKNESS = 0.5  # extension_is_pupil: the added area's median grey below this share of the iris ring's
 
 
 # Crop the image to maintain a specific aspect ratio (width:height) before resizing.
@@ -127,9 +133,32 @@ def get_darkest_areas(image, count, region=None):
     return points
 
 
+def adaptive_thresholds(gray, seed):
+    """(base, offsets) for _fit_at, from the seed's surroundings rather than its one pixel.
+
+    In a bright room the pupil is no longer uniformly black: ambient light lifts parts of it
+    to 30-40 grey while a noise pixel still reads 0, and a corneal reflection of the room can
+    split it in two. darkest + 5/15/25 then keeps only the darkest crescent and the ellipse
+    fits that. Here the base is the 5th percentile of a DARK_PATCH_PX patch, and each offset is
+    at least the original one and at least its THRESHOLD_SHARES of the gap up to the
+    SURROUND_PERCENTILE of a SURROUND_PX window, so the thresholds scale with the pupil's contrast.
+    On a pupil that is already black the wider thresholds can leak into a dark iris, so
+    _detect_in fits each seed both ways and lets the score pick.
+    """
+    def window(size):
+        half = size // 2
+        return gray[max(seed[1] - half, 0):seed[1] + half + 1, max(seed[0] - half, 0):seed[0] + half + 1]
+
+    base = int(np.percentile(window(DARK_PATCH_PX), 5))
+    gap = max(float(np.percentile(window(SURROUND_PX), SURROUND_PERCENTILE)) - base, 0.0)
+    return base, tuple(max(fixed, int(share * gap)) for fixed, share in zip(THRESHOLD_OFFSETS, THRESHOLD_SHARES))
+
+
 def pupil_contrast(gray, ellipse):
     """(ring - inside) / ring of the median grey levels: about 0.5+ for a pupil against its
-    iris, lower for a lash clump with skin showing through it."""
+    iris, lower for a lash clump with skin showing through it. Inside pixels brighter than the
+    ring's 90th percentile are left out: a corneal reflection over the pupil would otherwise
+    lift its median and let a lid or iris fit outrank it."""
     outer_ellipse = (ellipse[0], (ellipse[1][0] * 1.8, ellipse[1][1] * 1.8), ellipse[2])
     x, y, width, height = cv2.boundingRect(cv2.boxPoints(outer_ellipse).astype(np.int32))
     x0, y0 = max(x, 0), max(y, 0)
@@ -142,8 +171,37 @@ def pupil_contrast(gray, ellipse):
     ring[inside > 0] = 0
     if not inside.any() or not ring.any():
         return 0.0
-    inner, outer = np.median(gray[inside > 0]), np.median(gray[ring > 0])
+    inner_pixels, ring_pixels = gray[inside > 0], gray[ring > 0]
+    unlit = inner_pixels[inner_pixels <= np.percentile(ring_pixels, 90)]
+    inner = np.median(unlit) if unlit.size else np.median(inner_pixels)
+    outer = np.median(ring_pixels)
     return max(0.0, float(outer - inner) / max(float(outer), 1.0))
+
+
+def extension_is_pupil(gray, inner, outer):
+    """True when outer, a fit from the same seed, contains inner's center and the area it adds
+    is pupil-dark: a median grey under EXTENSION_DARKNESS of the ring around outer. With part of
+    the pupil lit by the room (~30 grey against a ~130 iris) the fixed thresholds fit the black
+    crescent and the adaptive ones the whole pupil, and the crescent's blacker inside gave it the
+    higher contrast, so the fit flipped between the two from frame to frame. When the adaptive
+    thresholds leak into a dark iris instead, the added area is iris-grey and this is False."""
+    outer_ring = (outer[0], (outer[1][0] * 1.8, outer[1][1] * 1.8), outer[2])
+    x, y, width, height = cv2.boundingRect(cv2.boxPoints(outer_ring).astype(np.int32))
+    x0, y0 = max(x, 0), max(y, 0)
+    gray = gray[y0:max(y + height, y0), x0:max(x + width, x0)]  # Only the ring's box, as in pupil_contrast
+    shifted = lambda e: ((e[0][0] - x0, e[0][1] - y0), e[1], e[2])
+    masks = {}
+    for name, ellipse in (("outer", outer), ("inner", inner), ("ring", outer_ring)):
+        masks[name] = np.zeros_like(gray)
+        cv2.ellipse(masks[name], shifted(ellipse), 255, -1)
+    cx, cy = int(inner[0][0]) - x0, int(inner[0][1]) - y0
+    if not (0 <= cy < gray.shape[0] and 0 <= cx < gray.shape[1]) or not masks["outer"][cy, cx]:
+        return False
+    added = (masks["outer"] > 0) & (masks["inner"] == 0)
+    ring = (masks["ring"] > 0) & (masks["outer"] == 0)
+    if added.sum() < 0.1 * np.count_nonzero(masks["outer"]) or not ring.any():
+        return False  # Hardly bigger: nothing to choose between
+    return float(np.median(gray[added])) < EXTENSION_DARKNESS * float(np.median(gray[ring]))
 
 
 def edge_support(gray, ellipse, samples=72):
@@ -288,12 +346,12 @@ def check_contour_pixels(contour, image_shape, debug_mode_on):
     overlap_thick = cv2.bitwise_and(contour_mask, ellipse_mask_thick)
     overlap_thin = cv2.bitwise_and(contour_mask, ellipse_mask_thin)
     
-    # Count the number of non-zero (white) pixels in the overlap
-    absolute_pixel_total_thick = np.sum(overlap_thick > 0)#compute with thicker border
-    absolute_pixel_total_thin = np.sum(overlap_thin > 0)#compute with thicker border
-    
+    # Count the number of non-zero (white) pixels in the overlap (countNonZero: the same counts as np.sum, faster)
+    absolute_pixel_total_thick = cv2.countNonZero(overlap_thick)#compute with thicker border
+    absolute_pixel_total_thin = cv2.countNonZero(overlap_thin)#compute with thicker border
+
     # Compute the ratio of pixels under the ellipse to the total pixels on the contour border
-    total_border_pixels = np.sum(contour_mask > 0)
+    total_border_pixels = cv2.countNonZero(contour_mask)
     
     ratio_under_ellipse = absolute_pixel_total_thin / total_border_pixels if total_border_pixels > 0 else 0
     
@@ -318,10 +376,10 @@ def check_ellipse_goodness(binary_image, contour, debug_mode_on):
     cv2.ellipse(mask, ellipse, (255), -1)
     
     # Calculate the number of pixels within the ellipse
-    ellipse_area = np.sum(mask == 255)
-    
+    ellipse_area = cv2.countNonZero(mask)  # The masks hold only 0 and 255
+
     # Calculate the number of white pixels within the ellipse
-    covered_pixels = np.sum((binary_image == 255) & (mask == 255))
+    covered_pixels = cv2.countNonZero(cv2.bitwise_and(binary_image, mask))
     
     # Calculate the percentage of covered white pixels within the ellipse
     if ellipse_area == 0:
@@ -363,8 +421,10 @@ def detect_pupil(frame, search_region=None, seeds=1):
     seeds: how many separate dark areas to fit from (get_darkest_areas). A lash clump darker
     than the pupil wins the single darkest area, and the original then fits the largest blob
     near it, wherever it starts. With seeds > 1 each fit uses only the blob around its own
-    seed, fits touching the frame edge are dropped, and the best confidence x pupil_contrast
-    is kept. None and 1: the original.
+    seed and is made twice, with the original thresholds and with adaptive_thresholds (a pupil
+    lit unevenly or split by a reflection); fits touching the frame edge are dropped, and the
+    best confidence x pupil_contrast is kept, the adaptive fit taking over its seed's fixed one
+    when it is the same pupil with more of it (extension_is_pupil). None and 1: the original.
     With seeds > 1 and a search_region there is no whole-frame check: one pass inside the
     circle, and fits centered outside it are dropped (no pupil rather than a lash fit). A wrong
     circle is fixed by resetting the eye model, not by searching past it.
@@ -386,13 +446,21 @@ def _detect_in(frame, search_region, seeds):
         if not points:
             return PupilObservation(frame)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        fits = [_fit_cropped(frame, point, search_region, refine=False) for point in points]
-        fits = [fit for fit in fits if fit.ellipse is not None and not touches_frame_edge(fit.ellipse, gray.shape)
-                and _inside_circle(fit.ellipse, search_region)]
+        candidates = [(point, adaptive) for point in points for adaptive in (False, True)]
+        fits = [(_fit_cropped(frame, point, search_region, refine=False, adaptive=adaptive), adaptive)
+                for point, adaptive in candidates]
+        fits = [(fit, adaptive) for fit, adaptive in fits if fit.ellipse is not None
+                and not touches_frame_edge(fit.ellipse, gray.shape) and _inside_circle(fit.ellipse, search_region)]
         if not fits:
             return PupilObservation(frame, points[0])
-        best = max(fits, key=lambda fit: fit.confidence * pupil_contrast(gray, fit.ellipse))
-        final = _fit_cropped(frame, best.darkest_point, search_region, refine=True)
+        score = {id(fit): fit.confidence * pupil_contrast(gray, fit.ellipse) for fit, _ in fits}
+        for crescent, adaptive in fits:
+            for whole, whole_adaptive in fits:
+                if (not adaptive and whole_adaptive and whole.darkest_point == crescent.darkest_point
+                        and extension_is_pupil(gray, crescent.ellipse, whole.ellipse)):
+                    score[id(whole)] = max(score[id(whole)], score[id(crescent)])  # Same pupil, all of it
+        best, adaptive = max(fits, key=lambda pair: (score[id(pair[0])], pair[1]))  # Ties: the whole pupil
+        final = _fit_cropped(frame, best.darkest_point, search_region, refine=True, adaptive=adaptive)
         if final.ellipse is not None and not _inside_circle(final.ellipse, search_region):
             return PupilObservation(frame, best.darkest_point)
         return final
@@ -415,14 +483,17 @@ def _inside_circle(ellipse, search_region):
             and max(ellipse[1]) / 2 <= search_region[2])
 
 
-def _fit_cropped(frame, seed, search_region, refine):
+def _fit_cropped(frame, seed, search_region, refine, adaptive=False):
     """_fit_at on its own blob, run on the box its 250 px threshold square leaves unmasked (plus
-    a margin for the ellipse masks): the full-frame mask sums made each seed cost a whole fit."""
+    a margin for the ellipse masks): the full-frame mask sums made each seed cost a whole fit.
+    adaptive: adaptive_thresholds instead of the seed pixel + THRESHOLD_OFFSETS."""
     half = 125 + FIT_CROP_MARGIN_PX
     x0, y0 = max(seed[0] - half, 0), max(seed[1] - half, 0)
     crop = frame[y0:seed[1] + half, x0:seed[0] + half]
     region = None if search_region is None else (search_region[0] - x0, search_region[1] - y0, search_region[2])
-    fit = _fit_at(crop, (seed[0] - x0, seed[1] - y0), region, own_blob=True, refine=refine)
+    local_seed = (seed[0] - x0, seed[1] - y0)
+    thresholds = adaptive_thresholds(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), local_seed) if adaptive else None
+    fit = _fit_at(crop, local_seed, region, own_blob=True, refine=refine, thresholds=thresholds)
     ellipse, center = fit.ellipse, fit.center
     if ellipse is not None:
         ellipse = ((ellipse[0][0] + x0, ellipse[0][1] + y0), ellipse[1], ellipse[2])
@@ -431,21 +502,24 @@ def _fit_cropped(frame, seed, search_region, refine):
     return PupilObservation(frame, seed, ellipse, center, fit.confidence)
 
 
-def _fit_at(frame, darkest_point, search_region, own_blob=False, refine=True):
-    """refine=False skips optimize_contours_by_angle (slow): enough to rank seeds."""
+def _fit_at(frame, darkest_point, search_region, own_blob=False, refine=True, thresholds=None):
+    """refine=False skips optimize_contours_by_angle (slow): enough to rank seeds.
+    thresholds: (base, (strict, medium, relaxed) offsets); None is the darkest pixel and THRESHOLD_OFFSETS."""
     # Convert to grayscale to handle pixel value operations
     gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    darkest_pixel_value = int(gray_frame[darkest_point[1], darkest_point[0]])
-    
+    if thresholds is None:
+        thresholds = (int(gray_frame[darkest_point[1], darkest_point[0]]), THRESHOLD_OFFSETS)
+    darkest_pixel_value, (strict, medium, relaxed) = thresholds
+
     # apply thresholding operations at different levels
     # at least one should give us a good ellipse segment
-    thresholded_image_strict = apply_binary_threshold(gray_frame, darkest_pixel_value, 5)#lite
+    thresholded_image_strict = apply_binary_threshold(gray_frame, darkest_pixel_value, strict)#lite
     thresholded_image_strict = mask_outside_square(thresholded_image_strict, darkest_point, 250)
 
-    thresholded_image_medium = apply_binary_threshold(gray_frame, darkest_pixel_value, 15)#medium
+    thresholded_image_medium = apply_binary_threshold(gray_frame, darkest_pixel_value, medium)#medium
     thresholded_image_medium = mask_outside_square(thresholded_image_medium, darkest_point, 250)
-    
-    thresholded_image_relaxed = apply_binary_threshold(gray_frame, darkest_pixel_value, 25)#heavy
+
+    thresholded_image_relaxed = apply_binary_threshold(gray_frame, darkest_pixel_value, relaxed)#heavy
     thresholded_image_relaxed = mask_outside_square(thresholded_image_relaxed, darkest_point, 250)
 
     image_array = [thresholded_image_relaxed, thresholded_image_medium, thresholded_image_strict] #holds images
